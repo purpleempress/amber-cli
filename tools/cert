@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# cert -- TLS certificate expiry for a host. An amber tool.
+#
+# Days until the cert expires, green with plenty of runway, amber as it nears,
+# red when it's close or already past.
+#
+# SC1091: lib is sourced via a runtime-resolved path; shellcheck can't always
+# locate it across CWDs. The source=../lib hint below covers static analysis.
+# shellcheck disable=SC1091
+set -euo pipefail
+export AMBERCLI_PROG=cert
+_self="$(readlink -f "$0")"
+AMBERCLI_LIB_DIR="$(dirname "$(dirname "$_self")")"
+[ -r "$AMBERCLI_LIB_DIR/lib" ] || { printf 'cert: cannot find lib at %s\n' "$AMBERCLI_LIB_DIR/lib" >&2; exit 1; }
+# shellcheck source=../lib
+. "$AMBERCLI_LIB_DIR/lib"
+
+case "${1:-}" in
+    -h | --help | "")
+        cat <<'EOF'
+cert -- TLS certificate expiry for a host
+
+Usage:
+  cert <host>[:port]      (port defaults to 443)
+EOF
+        [ "${1:-}" = "" ] && exit 1 || exit 0
+        ;;
+    --version) ambercli_version; exit 0 ;;
+esac
+
+ambercli_need openssl
+
+target="$1"
+host="${target%%:*}"
+port="${target##*:}"
+[ "$port" = "$host" ] && port=443
+
+if [ -t 1 ]; then
+    c_green=$'\e[38;5;113m'; c_amber=$'\e[38;5;214m'; c_red=$'\e[38;5;196m'; c_grey=$'\e[38;5;245m'
+else
+    c_green=''; c_amber=''; c_red=''; c_grey=''
+fi
+
+cert="$(echo | openssl s_client -servername "$host" -connect "$host:$port" 2>/dev/null \
+    | openssl x509 -noout -enddate -subject -issuer 2>/dev/null || true)"
+[ -n "$cert" ] || ambercli_die "couldn't fetch a certificate from $host:$port"
+
+enddate="$(sed -n 's/^notAfter=//p' <<<"$cert")"
+subject="$(sed -n 's/^subject=.*CN *= *//p' <<<"$cert" | head -n1)"
+issuer="$(sed -n 's/^issuer=.*CN *= *//p' <<<"$cert" | head -n1)"
+[ -n "$enddate" ] || ambercli_die "couldn't read the certificate's expiry"
+
+exp="$(date -d "$enddate" +%s 2>/dev/null || true)"
+[ -n "$exp" ] || ambercli_die "couldn't parse expiry date: $enddate"
+now="$(date +%s)"
+days=$(( (exp - now) / 86400 ))
+
+if   [ "$days" -le 7 ];  then col="$c_red";   note="expiring very soon"
+elif [ "$days" -le 30 ]; then col="$c_amber"; note="expiring soon"
+else col="$c_green"; note="ok"
+fi
+[ "$days" -lt 0 ] && { col="$c_red"; note="EXPIRED"; }
+
+printf '%s%s%s:%s%s\n' "$AMBERCLI_BOLD" "$AMBERCLI_ACCENT" "$host" "$port" "$AMBERCLI_RESET"
+printf '  %s%s days%s  (%s)\n' "$col" "$days" "$AMBERCLI_RESET" "$note"
+printf '  %sexpires%s %s\n' "$c_grey" "$AMBERCLI_RESET" "$enddate"
+[ -n "$subject" ] && printf '  %ssubject%s %s\n' "$c_grey" "$AMBERCLI_RESET" "$subject"
+[ -n "$issuer" ]  && printf '  %sissuer %s %s\n' "$c_grey" "$AMBERCLI_RESET" "$issuer"

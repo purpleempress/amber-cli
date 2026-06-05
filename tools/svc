@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# svc -- systemd services at a glance. An amber tool.
+#
+# Failed units jump out in red; a dim summary line counts running vs total.
+# Like dcls, a crash is loud and a healthy system is quiet.
+#
+# SC1091: lib is sourced via a runtime-resolved path; shellcheck can't always
+# locate it across CWDs. The source=../lib hint below covers static analysis.
+# shellcheck disable=SC1091
+set -uo pipefail
+export AMBERCLI_PROG=svc
+_self="$(readlink -f "$0")"
+AMBERCLI_LIB_DIR="$(dirname "$(dirname "$_self")")"
+[ -r "$AMBERCLI_LIB_DIR/lib" ] || { printf 'svc: cannot find lib at %s\n' "$AMBERCLI_LIB_DIR/lib" >&2; exit 1; }
+# shellcheck source=../lib
+. "$AMBERCLI_LIB_DIR/lib"
+
+case "${1:-}" in
+    -h | --help)
+        cat <<'EOF'
+svc -- systemd services at a glance
+
+Usage:
+  svc              list failed units (if any) + a running/total summary
+EOF
+        exit 0
+        ;;
+    --version) ambercli_version; exit 0 ;;
+    "") : ;;
+    *) ambercli_die "unknown argument: $1 (try -h)" ;;
+esac
+
+ambercli_need systemctl
+
+if [ -t 1 ]; then
+    c_green=$'\e[38;5;113m'; c_red=$'\e[38;5;196m'; c_grey=$'\e[38;5;245m'
+else
+    c_green=''; c_red=''; c_grey=''
+fi
+
+failed="$(systemctl list-units --type=service --state=failed --no-legend --no-pager 2>/dev/null)"
+running="$(systemctl list-units --type=service --state=running --no-legend --no-pager 2>/dev/null | grep -c .)"
+total="$(systemctl list-units --type=service --all --no-legend --no-pager 2>/dev/null | grep -c .)"
+
+printf '%s%sservices%s\n' "$AMBERCLI_BOLD" "$AMBERCLI_ACCENT" "$AMBERCLI_RESET"
+
+if [ -n "$failed" ]; then
+    while read -r unit _ _ _ desc; do
+        [ -n "$unit" ] || continue
+        printf '  %s●%s %-32s %s%s%s\n' \
+            "$c_red" "$AMBERCLI_RESET" "$unit" "$c_grey" "$desc" "$AMBERCLI_RESET"
+    done <<<"$failed"
+else
+    printf '  %s●%s no failed units\n' "$c_green" "$AMBERCLI_RESET"
+fi
+
+printf '%s  %s running / %s total%s\n' "$c_grey" "$running" "$total" "$AMBERCLI_RESET"

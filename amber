@@ -1,0 +1,729 @@
+#!/usr/bin/env bash
+#
+# amber -- git-style dispatcher for the amber toolkit.
+# Routes management verbs and dynamically-discovered tools in tools/.
+# MIT licensed.
+
+set -euo pipefail
+
+AMBERCLI_PROG=amber
+
+# --- resolve real location (so we work through a symlink) --------------------
+_self="$(readlink -f "$0")"
+AMBERCLI_LIB_DIR="$(dirname "$_self")"
+[ -r "$AMBERCLI_LIB_DIR/lib" ] || { printf 'amber: cannot find lib at %s\n' "$AMBERCLI_LIB_DIR/lib" >&2; exit 1; }
+# lib's final line is a `[ -f env ] && . env` guard that returns nonzero when
+# no env file exists; relax `set -e` across the source so that benign return
+# can't abort us. lib aborts on real errors via ambercli_die/exit itself.
+# shellcheck source=lib
+set +e; . "$AMBERCLI_LIB_DIR/lib"; set -e
+
+# Notify-only, fail-silent, self-gating on TTY / $AMBERCLI_NO_UPDATE_CHECK.
+ambercli_check_update
+
+# --- path resolution ----------------------------------------
+# Honour $AMBERCLI_PREFIX (highest precedence), then --system, else per-user.
+# Sets globals LIB_DIR and BIN_DIR. Consumes a single optional "--system" arg.
+_ambercli_resolve_paths() {
+    local want_system="${1:-0}"
+    if [ -n "${AMBERCLI_PREFIX:-}" ]; then
+        LIB_DIR="$AMBERCLI_PREFIX/lib/amber"
+        BIN_DIR="$AMBERCLI_PREFIX/bin"
+    elif [ "$want_system" = 1 ]; then
+        LIB_DIR="/usr/local/lib/amber"
+        BIN_DIR="/usr/local/bin"
+    else
+        LIB_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/amber"
+        BIN_DIR="$HOME/.local/bin"
+    fi
+}
+
+# Scan argv for a "--system" flag; print 1 if present, else 0.
+_ambercli_has_system() {
+    local a
+    for a in "$@"; do
+        [ "$a" = "--system" ] && { printf '1'; return; }
+    done
+    printf '0'
+}
+
+# List executable tool names in $AMBERCLI_LIB_DIR/tools (basenames, sorted).
+_ambercli_tools() {
+    local t
+    [ -d "$AMBERCLI_LIB_DIR/tools" ] || return 0
+    for t in "$AMBERCLI_LIB_DIR/tools"/*; do
+        [ -f "$t" ] && [ -x "$t" ] && printf '%s\n' "$(basename "$t")"
+    done
+}
+
+# --- usage -------------------------------------------------------------------
+usage() {
+    cat <<'EOF'
+amber -- a small, warm toolkit for the terminal
+
+Usage:
+  amber <tool> [args...]      run a tool (see "Tools" below)
+  amber <verb> [args...]      management command (see "Commands")
+  amber                       show this help
+
+Commands:
+  list                        list commands and discovered tools
+  version                     print the amber version
+  doctor                      health check (paths, deps, config)
+  link [--system]             symlink amber + tools into BIN_DIR
+  unlink [--system]           remove amber's symlinks from BIN_DIR
+  update [--stable|--edge] [--no-verify]
+                              verify the target signature, then update + relink
+  uninstall                   unlink and optionally remove the library
+  config get <key>            print a config value
+  config set <key> [value]    set a config value
+  config glyphs <unicode|ascii>
+  set <key> [value]           set geminikey or model (no-echo prompt)
+  install-prompt [--shell bash|fish|both]
+  uninstall-prompt [--shell bash|fish|both]
+  install-motd                install a system motd (sudo)
+  uninstall-motd              remove the installed motd (sudo)
+
+Options:
+  -h, --help                  show this help
+      --version               print the amber version
+EOF
+    local tools
+    tools="$(_ambercli_tools)"
+    printf '\nTools:\n'
+    if [ -n "$tools" ]; then
+        # shellcheck disable=SC2086  # intentional split: one tool per line
+        printf '  %s\n' $tools
+    else
+        printf '  (none discovered in %s/tools)\n' "$AMBERCLI_LIB_DIR"
+    fi
+}
+
+# --- verb: version -----------------------------------------------------------
+# Wrap ambercli_version in a command substitution so its internal `git describe`
+# (which exits nonzero on a tag-less repo and falls back to the short SHA) cannot
+# abort us under `set -e`.
+verb_version() {
+    local v
+    v="$(ambercli_version)"
+    printf '%s\n' "$v"
+}
+
+# --- verb: list --------------------------------------------------------------
+verb_list() {
+    printf 'Commands:\n'
+    printf '  %s\n' list version doctor link unlink update uninstall \
+        "config" set install-prompt uninstall-prompt install-motd uninstall-motd
+    printf '\nTools:\n'
+    local tools
+    tools="$(_ambercli_tools)"
+    if [ -n "$tools" ]; then
+        # shellcheck disable=SC2086  # intentional split: one tool per line
+        printf '  %s\n' $tools
+    else
+        printf '  (none)\n'
+    fi
+}
+
+# --- verb: link --------------------------------------------------------------
+# Canonical relink shared by install + update. Idempotent.
+verb_link() {
+    local sys
+    sys="$(_ambercli_has_system "$@")"
+    _ambercli_resolve_paths "$sys"
+
+    mkdir -p "$BIN_DIR"
+
+    local linked=0 t name
+    ln -sfn "$AMBERCLI_LIB_DIR/amber" "$BIN_DIR/amber"
+    printf 'linked %s -> %s\n' "$BIN_DIR/amber" "$AMBERCLI_LIB_DIR/amber"
+    linked=$((linked + 1))
+
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        t="$AMBERCLI_LIB_DIR/tools/$name"
+        ln -sfn "$t" "$BIN_DIR/$name"
+        printf 'linked %s -> %s\n' "$BIN_DIR/$name" "$t"
+        linked=$((linked + 1))
+    done < <(_ambercli_tools)
+
+    printf 'linked %d item(s) into %s\n' "$linked" "$BIN_DIR"
+}
+
+# --- verb: unlink ------------------------------------------------------------
+# Remove ONLY symlinks in BIN_DIR that resolve into LIB_DIR. Never touch real
+# files or links pointing elsewhere.
+verb_unlink() {
+    local sys
+    sys="$(_ambercli_has_system "$@")"
+    _ambercli_resolve_paths "$sys"
+
+    [ -d "$BIN_DIR" ] || { printf 'nothing to unlink (no %s)\n' "$BIN_DIR"; return 0; }
+
+    local removed=0 f target
+    for f in "$BIN_DIR"/*; do
+        [ -L "$f" ] || continue
+        target="$(readlink -f "$f" 2>/dev/null || true)"
+        case "$target" in
+            "$LIB_DIR"/* | "$LIB_DIR")
+                rm -f "$f"
+                printf 'removed %s\n' "$f"
+                removed=$((removed + 1))
+                ;;
+        esac
+    done
+    printf 'removed %d symlink(s) from %s\n' "$removed" "$BIN_DIR"
+}
+
+# --- verb: uninstall ---------------------------------------------------------
+verb_uninstall() {
+    local sys
+    sys="$(_ambercli_has_system "$@")"
+    _ambercli_resolve_paths "$sys"
+
+    printf 'amber: uninstalling.\n' >&2
+    printf '  - removing symlinks from %s\n' "$BIN_DIR" >&2
+    verb_unlink "$@"
+
+    if [ -d "$LIB_DIR" ]; then
+        printf '\nThe library lives at:\n  %s\n' "$LIB_DIR" >&2
+        printf 'Your config (%s) will be PRESERVED.\n' "$AMBERCLI_CONFIG_DIR" >&2
+        local reply
+        printf 'Remove the library directory too? [y/N] ' >&2
+        read -r reply </dev/tty 2>/dev/null || reply=""
+        case "$reply" in
+            y | Y | yes | YES | Yes)
+                rm -rf "$LIB_DIR"
+                printf 'removed %s\n' "$LIB_DIR" >&2
+                ;;
+            *)
+                printf 'kept %s\n' "$LIB_DIR" >&2
+                ;;
+        esac
+    fi
+    printf 'amber: uninstall complete. Config preserved at %s\n' "$AMBERCLI_CONFIG_DIR" >&2
+}
+
+# --- verb: update ------------------------------------------------------------
+verb_update() {
+    local channel="current" no_verify=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --stable) channel="stable" ;;
+            --edge)   channel="edge" ;;
+            --no-verify) no_verify=1 ;;
+            --system) : ;;  # handled by path resolution
+            *) ambercli_die "update: unknown option: $1" ;;
+        esac
+        shift
+    done
+
+    local git_dir="$AMBERCLI_LIB_DIR/.git"
+    [ -d "$git_dir" ] || ambercli_die "update: $AMBERCLI_LIB_DIR is not a git checkout -- reinstall via install"
+    ambercli_need git
+
+    local before after
+    before="$(ambercli_version)"
+
+    # 1) Fetch only -- no merge/checkout yet, so unverified code never lands.
+    git -C "$AMBERCLI_LIB_DIR" fetch --tags --quiet origin || ambercli_die "update: git fetch failed"
+
+    # 2) Resolve the target ref WITHOUT touching the working tree.
+    local target tag=""
+    case "$channel" in
+        edge)    target="origin/main" ;;
+        stable)
+            tag="$(git -C "$AMBERCLI_LIB_DIR" tag -l 'v[0-9]*' | sort -V | tail -n1)"
+            [ -n "$tag" ] || ambercli_die "update: no version tags found"
+            target="$tag"
+            ;;
+        current)
+            target="$(git -C "$AMBERCLI_LIB_DIR" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
+            [ -n "$target" ] || ambercli_die "update: no upstream for the current branch (try --edge or --stable)"
+            ;;
+    esac
+
+    # 3) VERIFY the target before applying. On failure ambercli_verify_ref aborts --
+    #    we stay on the current (already-trusted) ref, nothing is relinked.
+    if [ "$no_verify" = 1 ]; then export AMBERCLI_NO_VERIFY=1; fi
+    ambercli_verify_ref "$target"
+
+    # 4) Only now (verified) move the working tree onto the target.
+    case "$channel" in
+        edge)
+            git -C "$AMBERCLI_LIB_DIR" checkout --quiet main || ambercli_die "update: cannot checkout main"
+            git -C "$AMBERCLI_LIB_DIR" merge --ff-only --quiet origin/main \
+                || ambercli_die "update: refusing non-fast-forward merge on main. Resolve manually."
+            ;;
+        stable)
+            git -C "$AMBERCLI_LIB_DIR" checkout --quiet "$tag" || ambercli_die "update: cannot checkout $tag"
+            ;;
+        current)
+            git -C "$AMBERCLI_LIB_DIR" merge --ff-only --quiet "$target" \
+                || ambercli_die "update: refusing non-fast-forward merge (diverged branch). Resolve manually."
+            ;;
+    esac
+
+    after="$(ambercli_version)"
+    if [ "$before" = "$after" ]; then
+        printf 'amber: already up to date (%s)\n' "$after" >&2
+    else
+        printf 'amber: updated %s -> %s\n' "$before" "$after" >&2
+    fi
+
+    # Auto-link any NEW tools (and refresh existing links).
+    verb_link
+
+    # Refresh installed motd copy if one was recorded.
+    local motd_marker="$AMBERCLI_CONFIG_DIR/motd.installed"
+    if [ -f "$motd_marker" ]; then
+        local dest
+        dest="$(head -n1 "$motd_marker" 2>/dev/null || true)"
+        if [ -n "$dest" ]; then
+            _ambercli_refresh_installed_motd "$dest" || \
+                printf 'amber: note -- could not refresh installed motd at %s\n' "$dest" >&2
+        fi
+    fi
+    printf 'amber: prompts (if installed) update automatically -- they source the repo file.\n' >&2
+}
+
+# --- verb: doctor ------------------------------------------------------------
+verb_doctor() {
+    local sys
+    sys="$(_ambercli_has_system "$@")"
+    _ambercli_resolve_paths "$sys"
+
+    printf '%samber doctor%s\n' "$AMBERCLI_BOLD" "$AMBERCLI_RESET"
+    printf 'version:        %s\n' "$(ambercli_version)"
+    printf 'LIB_DIR:        %s\n' "$LIB_DIR"
+    printf 'BIN_DIR:        %s\n' "$BIN_DIR"
+    printf 'running from:   %s\n' "$AMBERCLI_LIB_DIR"
+
+    # BIN_DIR on PATH?
+    case ":$PATH:" in
+        *":$BIN_DIR:"*) printf 'PATH:           ok (%s on PATH)\n' "$BIN_DIR" ;;
+        *) printf 'PATH:           WARN -- %s is not on PATH\n' "$BIN_DIR" ;;
+    esac
+
+    # Dependencies (gpg + git are required for verified install/update).
+    local c status_line=""
+    for c in curl jq gpg git sd glow kitty fish; do
+        if command -v "$c" >/dev/null 2>&1; then
+            status_line="$status_line $c=yes"
+        else
+            status_line="$status_line $c=no"
+        fi
+    done
+    printf 'deps:          %s\n' "$status_line"
+
+    # Release signature verification.
+    if command -v gpg >/dev/null 2>&1; then
+        printf 'gpg:            present\n'
+    else
+        printf 'gpg:            MISSING -- required to verify releases (install gnupg)\n'
+    fi
+    if [ "$AMBERCLI_SIGNING_FPR" = "REPLACE_WITH_FULL_40_HEX_FINGERPRINT" ]; then
+        printf 'signing pin:    NOT SET (placeholder) -- verification will refuse until pinned\n'
+    else
+        printf 'signing pin:    set (%s)\n' "$AMBERCLI_SIGNING_FPR"
+    fi
+    # Does the currently-installed ref verify? (non-fatal: run in a subshell so
+    # ambercli_verify_ref's hard-fail can't abort doctor.)
+    local cur_ref verify_state
+    cur_ref="$(git -C "$AMBERCLI_LIB_DIR" describe --tags --exact-match 2>/dev/null || echo HEAD)"
+    if [ ! -d "$AMBERCLI_LIB_DIR/.git" ]; then
+        verify_state="n/a (not a git checkout)"
+    elif ( AMBERCLI_NO_VERIFY=0 ambercli_verify_ref "$cur_ref" ) >/dev/null 2>&1; then
+        verify_state="ok ($cur_ref verifies against pinned key)"
+    else
+        verify_state="FAIL ($cur_ref does not verify -- pin unset, gpg missing, or bad sig)"
+    fi
+    printf 'verified ref:   %s\n' "$verify_state"
+
+    # Gemini key (never print the value).
+    if [ -n "$(ambercli_config_get geminikey 2>/dev/null)" ]; then
+        printf 'gemini key:     set\n'
+    else
+        printf 'gemini key:     not set (run: amber set geminikey)\n'
+    fi
+
+    # Config dir + env perms.
+    printf 'config dir:     %s' "$AMBERCLI_CONFIG_DIR"
+    [ -d "$AMBERCLI_CONFIG_DIR" ] && printf ' (exists)\n' || printf ' (missing)\n'
+    if [ -f "$AMBERCLI_ENV_FILE" ]; then
+        local perms
+        perms="$(stat -c '%a' "$AMBERCLI_ENV_FILE" 2>/dev/null || stat -f '%Lp' "$AMBERCLI_ENV_FILE" 2>/dev/null || echo '?')"
+        if [ "$perms" = 600 ]; then
+            printf 'env file:       %s (perms %s ok)\n' "$AMBERCLI_ENV_FILE" "$perms"
+        else
+            printf 'env file:       %s (WARN perms %s, expected 600)\n' "$AMBERCLI_ENV_FILE" "$perms"
+        fi
+    else
+        printf 'env file:       (none)\n'
+    fi
+
+    # Glyph mode sample.
+    printf 'glyphs:         %s  (cross=%s hex=%s)\n' \
+        "${AMBERCLI_GLYPHS:-auto}" "$(ambercli_glyph cross)" "$(ambercli_glyph hex)"
+
+    # Prompt installed?
+    local bashrc="$HOME/.bashrc" fishconf="$HOME/.config/fish/conf.d/amber-prompt.fish"
+    if [ -f "$bashrc" ] && grep -q '# >>> amber prompt >>>' "$bashrc" 2>/dev/null; then
+        printf 'bash prompt:    installed\n'
+    else
+        printf 'bash prompt:    not installed\n'
+    fi
+    if [ -L "$fishconf" ]; then
+        printf 'fish prompt:    installed (%s)\n' "$fishconf"
+    else
+        printf 'fish prompt:    not installed\n'
+    fi
+
+    # motd installed?
+    if [ -f "$AMBERCLI_CONFIG_DIR/motd.installed" ]; then
+        printf 'motd:           installed (%s)\n' "$(head -n1 "$AMBERCLI_CONFIG_DIR/motd.installed" 2>/dev/null)"
+    else
+        printf 'motd:           not installed\n'
+    fi
+    return 0
+}
+
+# --- verb: config ------------------------------------------------------------
+verb_config() {
+    local sub="${1:-}"
+    shift || true
+    case "$sub" in
+        get)
+            [ "$#" -ge 1 ] || ambercli_die "config get: missing key"
+            ambercli_config_get "$1"
+            ;;
+        set)
+            [ "$#" -ge 1 ] || ambercli_die "config set: missing key"
+            ambercli_config_set "$@"
+            ;;
+        glyphs)
+            [ "$#" -ge 1 ] || ambercli_die "config glyphs: expected 'unicode' or 'ascii'"
+            case "$1" in
+                unicode | ascii) ambercli_config_set glyphs "$1" ;;
+                *) ambercli_die "config glyphs: invalid value '$1' (expected unicode or ascii)" ;;
+            esac
+            ;;
+        *)
+            ambercli_die "config: unknown subcommand '$sub' (use get/set/glyphs)"
+            ;;
+    esac
+}
+
+# --- verb: set ---------------------------------------------------------------
+verb_set() {
+    local key="${1:-}"
+    [ -n "$key" ] || ambercli_die "set: missing key (geminikey, githubtoken, or model)"
+    case "$key" in
+        geminikey | githubtoken | model) : ;;
+        *) ambercli_die "set: unknown key '$key' (known: geminikey, githubtoken, model)" ;;
+    esac
+    shift
+    if [ "$#" -ge 1 ]; then
+        printf '%s: warning: passing the value inline leaks it into shell history; prefer the no-echo prompt.\n' \
+            "$AMBERCLI_PROG" >&2
+        ambercli_config_set "$key" "$1"
+    else
+        ambercli_config_set "$key"
+    fi
+    printf '%s: %s saved to %s\n' "$AMBERCLI_PROG" "$key" "$AMBERCLI_ENV_FILE" >&2
+}
+
+# --- prompt install ----------------------------------------------------------
+# Parse "--shell X" out of args. Prints the explicit choice, or "auto" when none
+# is given (the verbs treat "auto" as "both, where it makes sense").
+_ambercli_prompt_shell() {
+    local choice=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --shell) choice="${2:-}"; shift 2 || true; continue ;;
+            *) shift ;;
+        esac
+    done
+    [ -n "$choice" ] || { printf 'auto'; return; }
+    case "$choice" in
+        bash | fish | both) printf '%s' "$choice" ;;
+        *) ambercli_die "install-prompt: invalid --shell '$choice' (bash|fish|both)" ;;
+    esac
+}
+
+_ambercli_install_prompt_bash() {
+    local lib="$1"
+    local bashrc="$HOME/.bashrc"
+    local pfile="$lib/prompts/prompt.bash"
+    [ -f "$pfile" ] || ambercli_die "install-prompt: $pfile not found"
+    bash -n "$pfile" || ambercli_die "install-prompt: $pfile has syntax errors; refusing to wire it up"
+
+    touch "$bashrc"
+    local backup
+    backup="$bashrc.amber-backup.$(date +%Y%m%d%H%M%S)"
+    cp -p "$bashrc" "$backup"
+
+    local begin='# >>> amber prompt >>>'
+    local end='# <<< amber prompt <<<'
+
+    # Build the managed block.
+    local block
+    block="$begin
+# Managed by amber; edit via 'amber install-prompt'. Do not edit by hand.
+[ -f \"$pfile\" ] && . \"$pfile\""
+    if [ "${AMBERCLI_BASH_RIGHT_PROMPT:-}" = 1 ]; then
+        block="$block
+export AMBERCLI_BASH_RIGHT_PROMPT=1"
+    fi
+    block="$block
+$end"
+
+    # Rewrite in place: drop any existing block, then append fresh.
+    local tmp
+    tmp="$(mktemp)"
+    awk -v b="$begin" -v e="$end" '
+        $0==b {skip=1; next}
+        $0==e {skip=0; next}
+        skip!=1 {print}
+    ' "$bashrc" >"$tmp"
+    printf '%s\n' "$block" >>"$tmp"
+    mv "$tmp" "$bashrc"
+    printf 'amber: bash prompt wired into %s (backup: %s)\n' "$bashrc" "$backup" >&2
+}
+
+_ambercli_install_prompt_fish() {
+    local lib="$1"
+    local pfile="$lib/prompts/prompt.fish"
+    [ -f "$pfile" ] || ambercli_die "install-prompt: $pfile not found"
+    if command -v fish >/dev/null 2>&1; then
+        fish -n "$pfile" || ambercli_die "install-prompt: $pfile has syntax errors; refusing to wire it up"
+    else
+        printf 'amber: note -- fish not installed; skipping syntax check.\n' >&2
+    fi
+
+    local confd="$HOME/.config/fish/conf.d"
+    local dest="$confd/amber-prompt.fish"
+    mkdir -p "$confd"
+    if [ -e "$dest" ] && [ ! -L "$dest" ]; then
+        local backup
+        backup="$dest.amber-backup.$(date +%Y%m%d%H%M%S)"
+        cp -p "$dest" "$backup"
+        printf 'amber: backed up existing %s -> %s\n' "$dest" "$backup" >&2
+    fi
+    ln -sfn "$pfile" "$dest"
+    printf 'amber: fish prompt linked %s -> %s\n' "$dest" "$pfile" >&2
+}
+
+verb_install_prompt() {
+    local which
+    which="$(_ambercli_prompt_shell "$@")"
+    case "$which" in
+        bash) _ambercli_install_prompt_bash "$AMBERCLI_LIB_DIR" ;;
+        fish) _ambercli_install_prompt_fish "$AMBERCLI_LIB_DIR" ;;
+        both) _ambercli_install_prompt_bash "$AMBERCLI_LIB_DIR"; _ambercli_install_prompt_fish "$AMBERCLI_LIB_DIR" ;;
+        auto)
+            # Default: install to both shells, skipping fish if it isn't present.
+            _ambercli_install_prompt_bash "$AMBERCLI_LIB_DIR"
+            if command -v fish >/dev/null 2>&1; then
+                _ambercli_install_prompt_fish "$AMBERCLI_LIB_DIR"
+            else
+                printf 'amber: fish not installed; wired bash only (use --shell fish to force).\n' >&2
+            fi
+            ;;
+    esac
+}
+
+_ambercli_uninstall_prompt_bash() {
+    local bashrc="$HOME/.bashrc"
+    [ -f "$bashrc" ] || { printf 'amber: no %s\n' "$bashrc" >&2; return 0; }
+    local begin='# >>> amber prompt >>>'
+    local end='# <<< amber prompt <<<'
+    grep -q "$begin" "$bashrc" 2>/dev/null || { printf 'amber: no bash prompt block in %s\n' "$bashrc" >&2; return 0; }
+    local backup
+    backup="$bashrc.amber-backup.$(date +%Y%m%d%H%M%S)"
+    cp -p "$bashrc" "$backup"
+    local tmp
+    tmp="$(mktemp)"
+    awk -v b="$begin" -v e="$end" '
+        $0==b {skip=1; next}
+        $0==e {skip=0; next}
+        skip!=1 {print}
+    ' "$bashrc" >"$tmp"
+    mv "$tmp" "$bashrc"
+    printf 'amber: removed bash prompt block from %s (backup: %s)\n' "$bashrc" "$backup" >&2
+}
+
+_ambercli_uninstall_prompt_fish() {
+    local dest="$HOME/.config/fish/conf.d/amber-prompt.fish"
+    if [ -L "$dest" ]; then
+        rm -f "$dest"
+        printf 'amber: removed fish prompt symlink %s\n' "$dest" >&2
+    else
+        printf 'amber: no fish prompt symlink at %s\n' "$dest" >&2
+    fi
+}
+
+verb_uninstall_prompt() {
+    local which
+    which="$(_ambercli_prompt_shell "$@")"
+    case "$which" in
+        bash) _ambercli_uninstall_prompt_bash ;;
+        fish) _ambercli_uninstall_prompt_fish ;;
+        # both/auto: remove from wherever it's installed (helpers no-op otherwise).
+        both | auto) _ambercli_uninstall_prompt_bash; _ambercli_uninstall_prompt_fish ;;
+    esac
+}
+
+# --- motd install ------------------------------------------------------------
+# The repo `motd` is a DYNAMIC banner script (host, uptime, load, ip, ...). On
+# update-motd.d systems we install the script itself so it runs fresh at every
+# login; on static /etc/motd systems we snapshot its output once.
+
+# Snapshot the dynamic banner's current output to stdout (for static /etc/motd).
+_ambercli_motd_snapshot() {
+    local src="$AMBERCLI_LIB_DIR/motd"
+    [ -f "$src" ] || ambercli_die "motd: source $src not found"
+    bash "$src"
+}
+
+# Install/refresh the dynamic banner script into update-motd.d. $1=dest.
+_ambercli_install_updatemotd() {
+    local dest="$1" src="$AMBERCLI_LIB_DIR/motd"
+    [ -f "$src" ] || ambercli_die "motd: source $src not found"
+    sudo cp "$src" "$dest"
+    sudo chmod 0755 "$dest"
+}
+
+# Refresh an already-installed motd in place (used by update). $1=dest path.
+# update-motd.d: re-copy the dynamic script. Static: re-snapshot to /etc/motd.
+_ambercli_refresh_installed_motd() {
+    local dest="$1"
+    case "$dest" in
+        */update-motd.d/*) _ambercli_install_updatemotd "$dest" ;;
+        *)                 _ambercli_motd_snapshot | sudo tee "$dest" >/dev/null ;;
+    esac
+}
+
+verb_install_motd() {
+    ambercli_need sudo
+    local marker="$AMBERCLI_CONFIG_DIR/motd.installed"
+    mkdir -p "$AMBERCLI_CONFIG_DIR"
+
+    if [ -d /etc/update-motd.d ]; then
+        local dest="/etc/update-motd.d/00-amber"
+        printf 'amber: this will install the DYNAMIC amber banner script (root, via sudo):\n' >&2
+        printf '  %s\n' "$dest" >&2
+        printf 'pam_motd runs it fresh for ALL users at every login.\n' >&2
+        local reply
+        printf 'Proceed? [y/N] ' >&2
+        read -r reply </dev/tty 2>/dev/null || reply=""
+        case "$reply" in
+            y | Y | yes | YES | Yes) : ;;
+            *) ambercli_die "install-motd: aborted" ;;
+        esac
+        _ambercli_install_updatemotd "$dest"
+        printf '%s\n' "$dest" >"$marker"
+        printf 'amber: installed %s\n' "$dest" >&2
+    elif [ -e /etc/motd ] || [ -d /etc ]; then
+        local dest="/etc/motd"
+        printf 'amber: no /etc/update-motd.d here, so this writes a STATIC snapshot of\n' >&2
+        printf 'the banner to the system motd (root, via sudo):\n' >&2
+        printf '  %s\n' "$dest" >&2
+        printf 'It will not auto-refresh; re-run install-motd (or amber update) to update.\n' >&2
+        printf 'The current file will be backed up first.\n' >&2
+        local reply
+        printf 'Proceed? [y/N] ' >&2
+        read -r reply </dev/tty 2>/dev/null || reply=""
+        case "$reply" in
+            y | Y | yes | YES | Yes) : ;;
+            *) ambercli_die "install-motd: aborted" ;;
+        esac
+        local backup
+        backup="/etc/motd.amber-backup.$(date +%Y%m%d%H%M%S)"
+        if [ -f /etc/motd ]; then
+            sudo cp -p /etc/motd "$backup"
+            printf 'amber: backed up /etc/motd -> %s\n' "$backup" >&2
+        else
+            backup=""
+        fi
+        _ambercli_motd_snapshot | sudo tee "$dest" >/dev/null
+        # Record dest + backup (line 2) for clean uninstall.
+        { printf '%s\n' "$dest"; [ -n "$backup" ] && printf '%s\n' "$backup"; } >"$marker"
+        printf 'amber: wrote %s\n' "$dest" >&2
+    else
+        ambercli_die "install-motd: unsupported system (no /etc/update-motd.d and no /etc/motd)"
+    fi
+}
+
+verb_uninstall_motd() {
+    ambercli_need sudo
+    local marker="$AMBERCLI_CONFIG_DIR/motd.installed"
+    [ -f "$marker" ] || { printf 'amber: motd not installed (no marker)\n' >&2; return 0; }
+
+    local dest backup
+    dest="$(sed -n '1p' "$marker" 2>/dev/null)"
+    backup="$(sed -n '2p' "$marker" 2>/dev/null)"
+
+    case "$dest" in
+        */update-motd.d/00-amber)
+            if [ -e "$dest" ]; then
+                sudo rm -f "$dest"
+                printf 'amber: removed %s\n' "$dest" >&2
+            fi
+            ;;
+        /etc/motd)
+            if [ -n "$backup" ] && [ -f "$backup" ]; then
+                sudo cp -p "$backup" "$dest"
+                printf 'amber: restored %s from %s\n' "$dest" "$backup" >&2
+            else
+                printf 'amber: no backup recorded; leaving %s in place\n' "$dest" >&2
+            fi
+            ;;
+        *)
+            printf 'amber: unrecognized motd marker target: %s\n' "$dest" >&2
+            ;;
+    esac
+    rm -f "$marker"
+    printf 'amber: motd uninstalled\n' >&2
+}
+
+# --- dispatch ----------------------------------------------------------------
+main() {
+    if [ "$#" -eq 0 ]; then
+        usage
+        exit 0
+    fi
+
+    local cmd="$1"
+    shift
+
+    case "$cmd" in
+        -h | --help) usage; exit 0 ;;
+        --version)   verb_version; exit 0 ;;
+        version)     verb_version ;;
+        list)        verb_list ;;
+        doctor)      verb_doctor "$@" ;;
+        link)        verb_link "$@" ;;
+        unlink)      verb_unlink "$@" ;;
+        update)      verb_update "$@" ;;
+        uninstall)   verb_uninstall "$@" ;;
+        config)      verb_config "$@" ;;
+        set)         verb_set "$@" ;;
+        install-prompt)   verb_install_prompt "$@" ;;
+        uninstall-prompt) verb_uninstall_prompt "$@" ;;
+        install-motd)     verb_install_motd "$@" ;;
+        uninstall-motd)   verb_uninstall_motd "$@" ;;
+        *)
+            # Not a verb -- try a tool.
+            local tool="$AMBERCLI_LIB_DIR/tools/$cmd"
+            if [ -f "$tool" ] && [ -x "$tool" ]; then
+                exec "$tool" "$@"
+            fi
+            printf '%s: unknown command or tool: %s\n\n' "$AMBERCLI_PROG" "$cmd" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

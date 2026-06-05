@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# amber dynamic login banner :3  -- Managed by amber (amber install-motd).
+#
+# Designed for /etc/update-motd.d/00-amber (pam_motd runs every executable
+# there at login). `amber install-motd` drops it there on update-motd.d systems,
+# or snapshots its output into /etc/motd on systems without update-motd.d.
+#
+# motd output is plain text -- ANSI colours work fine, NONE of the \[ \]
+# prompt-marker stuff is needed here (that's a readline-only concern).
+
+ESC=$'\e'
+grey="${ESC}[38;5;245m"
+bold="${ESC}[1m"
+reset="${ESC}[0m"
+
+host=$(hostname -s)
+datestr=$(date '+%a %d %b · %H:%M')
+
+# --- per-host accent colour --------------------------------------------
+# Derived EXACTLY like prompts/prompt.bash's host colour, so the banner accent
+# matches the prompt on every box: same hand-picked palette (196/red left out
+# so it never reads as an error marker), same cksum-of-short-hostname hash,
+# same modulo. `printf '%s'` (no trailing newline) feeds cksum to match.
+_host_palette=(39 45 75 81 111 113 141 147 170 178 208 209 213 214 215 220 76 80 110 168 176 180)
+_host_hash=$(printf '%s' "$host" | cksum)
+_host_hash=${_host_hash%% *}
+accent="${ESC}[38;5;${_host_palette[$(( _host_hash % ${#_host_palette[@]} ))]}m"
+
+# --- gather -------------------------------------------------------------
+os="unknown"
+# shellcheck disable=SC1091  # /etc/os-release is a runtime file, not in-repo.
+# shellcheck disable=SC2153  # PRETTY_NAME comes from sourcing os-release.
+[[ -r /etc/os-release ]] && os=$(. /etc/os-release && echo "${PRETTY_NAME:-unknown}")
+kernel=$(uname -r)
+up=$(uptime -p 2>/dev/null | sed 's/^up //'); up=${up:-unknown}
+load=$(cut -d' ' -f1-3 /proc/loadavg)
+mem=$(free -h 2>/dev/null | awk 'NR==2{print $3" / "$2}')
+disk=$(df -h / | awk 'NR==2{print $3" / "$2"  ("$5" used)"}')
+ips=$(ip -o -4 addr show scope global 2>/dev/null \
+        | awk '$2 !~ /^(docker|br-|veth|virbr|cni|flannel|cali|kube)/ {
+                 sub(/\/.*/, "", $4); a[++n] = $4 }
+               END { for (i = 1; i <= n; i++)
+                       printf "%s%s", (i > 1 ? " · " : ""), a[i] }')
+[[ -n "$ips" ]] || ips="(none)"
+
+docker_line=""
+if command -v docker >/dev/null 2>&1; then
+    run=$(docker ps  -q 2>/dev/null | wc -l)
+    all=$(docker ps -aq 2>/dev/null | wc -l)
+    docker_line="${run} running / ${all} total"
+fi
+
+# --- render -------------------------------------------------------------
+row() { printf '   %s%-9s%s %s\n' "$grey" "$1" "$reset" "$2"; }
+
+echo
+printf '   %s%s◆ %s%s   %s%s%s\n' "$bold" "$accent" "$host" "$reset" "$grey" "$datestr" "$reset"
+printf '   %s%s%s\n\n' "$accent" "$(printf '─%.0s' {1..44})" "$reset"
+row "os"      "$os"
+row "kernel"  "$kernel"
+row "uptime"  "$up"
+row "load"    "$load"
+row "memory"  "$mem"
+row "disk /"  "$disk"
+[[ -n "$docker_line" ]] && row "docker" "$docker_line"
+row "address" "$ips"
+echo

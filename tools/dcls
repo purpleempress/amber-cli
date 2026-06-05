@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# dcls -- prettier cross-project docker overview. An amber tool.
+#
+# Despite the name it's closer to a global `docker compose ps`: it shows every
+# compose PROJECT *and* the containers under each, not just project names.
+#
+# SC1091: lib is sourced via a runtime-resolved path; shellcheck can't always
+# locate it across CWDs. The source=../lib hint below covers static analysis.
+# shellcheck disable=SC1091
+set -uo pipefail
+export AMBERCLI_PROG=dcls
+_self="$(readlink -f "$0")"
+AMBERCLI_LIB_DIR="$(dirname "$(dirname "$_self")")"
+[ -r "$AMBERCLI_LIB_DIR/lib" ] || { printf 'dcls: cannot find lib at %s\n' "$AMBERCLI_LIB_DIR/lib" >&2; exit 1; }
+# shellcheck source=../lib
+. "$AMBERCLI_LIB_DIR/lib"
+
+case "${1:-}" in
+    -h | --help)
+        cat <<'EOF'
+dcls -- global docker overview (every compose project + its containers)
+
+Usage:
+  dcls            list all containers grouped by compose project
+
+A clean exit (0) of a stopped container stays calm grey; a non-zero exit
+goes red, so a crash jumps out and a deliberately-stopped one-shot doesn't.
+EOF
+        exit 0
+        ;;
+    --version) ambercli_version; exit 0 ;;
+    "") : ;;
+    *) ambercli_die "unknown argument: $1 (try -h)" ;;
+esac
+
+ambercli_need docker
+
+ESC=$'\e'
+purple="${ESC}[38;5;141m"   # brand accent (project headers)
+amber="${ESC}[38;5;214m"    # warning state (some containers down)
+grey="${ESC}[38;5;245m"
+green="${ESC}[38;5;113m"
+red="${ESC}[38;5;196m"
+bold="${ESC}[1m"
+reset="${ESC}[0m"
+
+# tab-separated: project | service | name | state | status
+# .Label "<key>" pulls the compose labels off each container.
+fmt='{{.Label "com.docker.compose.project"}}'
+fmt+='\t{{.Label "com.docker.compose.service"}}'
+fmt+='\t{{.Names}}\t{{.State}}\t{{.Status}}'
+
+data=$(docker ps -a --format "$fmt" 2>/dev/null) \
+    || ambercli_die "cannot reach the docker daemon"
+[[ -n "$data" ]] || { printf '%sno containers%s\n' "$grey" "$reset"; exit 0; }
+
+# sort by project, then service, so we can group with a single pass.
+data=$(LC_ALL=C sort -t$'\t' -k1,1 -k2,2 <<<"$data")
+
+last=""
+while IFS=$'\t' read -r proj svc name state status; do
+    [[ -n "$proj" ]] || proj="(standalone)"   # non-compose containers
+    [[ -n "$svc"  ]] || svc="$name"
+
+    # project header, printed once per group
+    if [[ "$proj" != "$last" ]]; then
+        printf '\n  %s%s%s%s\n' "$bold" "$purple" "$proj" "$reset"
+        last="$proj"
+    fi
+
+    # colour by state. a CLEAN exit (0) stays calm grey; only a non-zero exit
+    # goes red -- so a crash actually jumps out and a deliberately-stopped
+    # one-shot container doesn't cry wolf.
+    case "$state" in
+        running)            col="$green"; dot='●' ;;
+        restarting|paused)  col="$amber"; dot='●' ;;
+        exited|dead)
+            if [[ "$status" == *'(0)'* ]]; then
+                col="$grey"; dot='○'
+            else
+                col="$red";  dot='●'
+            fi ;;
+        *)                  col="$grey"; dot='○' ;;
+    esac
+
+    # dot+state-colour | service (the meaningful name) | container | status
+    printf '    %s%s%s %-16s %s%-22s%s %s\n' \
+        "$col" "$dot" "$reset" "$svc" "$grey" "$name" "$reset" "$status"
+done <<<"$data"
+echo

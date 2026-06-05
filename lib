@@ -1,0 +1,514 @@
+# shellcheck shell=bash
+#
+# lib -- shared library for the `amber` toolkit. Sourced by `amber` and every
+# tool; never executed directly. Provides the Gemini client, markdown render,
+# secret scrub, config get/set, jq bootstrap, glyphs, release-signature
+# verification, and the update check. MIT licensed.
+
+# Idempotent on double-source.
+[ -n "${_AMBERCLI_LIB_LOADED:-}" ] && return 0
+_AMBERCLI_LIB_LOADED=1
+
+# --- self location (real dir of this file = LIB_DIR) -------------------------
+AMBERCLI_SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+
+# --- constants & paths -------------------------------------------------------
+AMBERCLI_GEMINI_API_BASE="https://generativelanguage.googleapis.com/v1beta"
+# shellcheck disable=SC2034  # AMBERCLI_DEFAULT_MODEL is consumed by tools that source this lib.
+AMBERCLI_DEFAULT_MODEL="gemini-3.5-flash"
+# External API endpoints, named per service so every host the toolkit talks to
+# is listed in one place. Each is read by a tool, not by lib itself.
+# shellcheck disable=SC2034
+AMBERCLI_IPWHOIS_API_BASE="https://ipwho.is"                                    # ipl
+# shellcheck disable=SC2034
+AMBERCLI_OPENMETEO_API_BASE="https://api.open-meteo.com/v1"                     # wx forecast
+# shellcheck disable=SC2034
+AMBERCLI_OPENMETEO_GEOCODING_API_BASE="https://geocoding-api.open-meteo.com/v1" # wx geocoding
+# shellcheck disable=SC2034
+AMBERCLI_GITHUB_API_BASE="https://api.github.com"                               # prs
+# shellcheck disable=SC2034
+AMBERCLI_DICTIONARY_API_BASE="https://api.dictionaryapi.dev/api/v2/entries/en"  # define
+AMBERCLI_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/amber"
+AMBERCLI_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/amber"
+AMBERCLI_ENV_FILE="$AMBERCLI_CONFIG_DIR/env"
+AMBERCLI_REPO="purpleempress/amber-cli"
+: "${AMBERCLI_RAW:=0}"
+: "${AMBERCLI_PROG:=amber}"
+
+# --- pinned trust anchor (release signature verification) --------------------
+# Expected signing-key fingerprint: full 40 hex chars, no spaces. This is the
+# anchor -- releases (signed git tags / commits) are trusted ONLY if signed by
+# this key.
+AMBERCLI_SIGNING_FPR="00FC77A24586FC735DA4AB26BE7CF33811ED73D4"
+
+# --- ANSI styling, gated on stdout TTY ---------------------------------------
+# AMBERCLI_ACCENT is the brand colour (purple, 141). It's the toolkit's signature
+# accent for tool headers/titles; it is NOT a status colour (green/amber/red
+# keep their traffic-light meaning). Read by the tools, not by lib.
+if [ -t 1 ]; then
+    AMBERCLI_BOLD=$'\e[1m'; AMBERCLI_DIM=$'\e[2m'; AMBERCLI_RESET=$'\e[0m'
+    # shellcheck disable=SC2034
+    AMBERCLI_ACCENT=$'\e[38;5;141m'
+else
+    AMBERCLI_BOLD=''; AMBERCLI_DIM=''; AMBERCLI_RESET=''
+    # shellcheck disable=SC2034
+    AMBERCLI_ACCENT=''
+fi
+
+# --- glyph table --------------------------------------------
+# ambercli_glyph NAME -> unicode or ascii variant per $AMBERCLI_GLYPHS.
+ambercli_glyph() {
+    local name="$1" mode="${AMBERCLI_GLYPHS:-}"
+    if [ -z "$mode" ]; then
+        case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+            *UTF-8* | *utf8* | *UTF8*) mode="unicode" ;;
+            *) mode="ascii" ;;
+        esac
+    fi
+    case "$name" in
+        cross) [ "$mode" = ascii ] && printf 'x' || printf '✘' ;;
+        hex)   [ "$mode" = ascii ] && printf '#' || printf '⬢' ;;
+        *) : ;;  # unknown glyph -> nothing
+    esac
+}
+
+# --- diagnostics -------------------------------------------------------------
+ambercli_die() {
+    printf '%s: %s\n' "${AMBERCLI_PROG:-amber}" "$1" >&2
+    exit 1
+}
+
+ambercli_need() {
+    command -v "$1" >/dev/null 2>&1 || ambercli_die "$1 is required but not found; install it and retry"
+}
+
+# --- dependency bootstrap ----------------------------------------------------
+# Ensure jq is present. If missing, detect the system package manager, print the
+# EXACT install command to stderr, and run it only after explicit confirmation
+# (auto-confirmed by $AMBERCLI_YES / $AMBERCLI_AUTOINSTALL). Never silent-sudo.
+ambercli_ensure_jq() {
+    command -v jq >/dev/null 2>&1 && return 0
+
+    local cmd=""
+    if command -v apt-get >/dev/null 2>&1; then
+        cmd="sudo apt-get install -y jq"
+    elif command -v dnf >/dev/null 2>&1; then
+        cmd="sudo dnf install -y jq"
+    elif command -v pacman >/dev/null 2>&1; then
+        cmd="sudo pacman -S --noconfirm jq"
+    elif command -v zypper >/dev/null 2>&1; then
+        cmd="sudo zypper install -y jq"
+    elif command -v apk >/dev/null 2>&1; then
+        cmd="sudo apk add jq"
+    elif command -v brew >/dev/null 2>&1; then
+        cmd="brew install jq"   # brew never uses sudo
+    elif command -v port >/dev/null 2>&1; then
+        cmd="sudo port install jq"
+    else
+        printf '%s\n' "amber: jq is required but no known package manager was found." >&2
+        printf '%s\n' "Install jq manually: https://jqlang.github.io/jq/download/" >&2
+        ambercli_die "jq not found"
+    fi
+
+    printf '%s\n' "amber: jq is required. Suggested install command:" >&2
+    printf '  %s\n' "$cmd" >&2
+
+    if [ "${AMBERCLI_YES:-0}" = 1 ] || [ "${AMBERCLI_AUTOINSTALL:-0}" = 1 ]; then
+        printf '%s\n' "Running (auto-confirmed): $cmd" >&2
+        eval "$cmd" >&2
+    else
+        local reply
+        printf 'Run it now? [y/N] ' >&2
+        read -r reply </dev/tty 2>/dev/null || reply=""
+        case "$reply" in
+            y | Y | yes | YES | Yes) eval "$cmd" >&2 ;;
+            *) ambercli_die "jq is required; aborting" ;;
+        esac
+    fi
+
+    command -v jq >/dev/null 2>&1 || ambercli_die "jq still not found after install attempt"
+}
+
+# --- config get/set ----------------------------------------------------------
+# Map a logical key to the env-var name written into $AMBERCLI_ENV_FILE.
+_ambercli_config_var() {
+    case "$1" in
+        geminikey)   printf 'GEMINI_API_KEY' ;;
+        githubtoken) printf 'GITHUB_TOKEN' ;;
+        model)       printf 'AMBERCLI_MODEL' ;;
+        glyphs)      printf 'AMBERCLI_GLYPHS' ;;
+        *) ambercli_die "unknown config key: $1 (known: geminikey, githubtoken, model, glyphs)" ;;
+    esac
+}
+
+ambercli_config_get() {
+    local var line
+    var="$(_ambercli_config_var "$1")"
+    [ -f "$AMBERCLI_ENV_FILE" ] || return 0
+    # Last matching assignment wins; strip the VAR= prefix and surrounding quotes.
+    line="$(grep -E "^${var}=" "$AMBERCLI_ENV_FILE" 2>/dev/null | tail -n1)"
+    [ -n "$line" ] || return 0
+    line="${line#"${var}"=}"
+    # Strip a single layer of single/double quotes if present.
+    case "$line" in
+        \'*\') line="${line#\'}"; line="${line%\'}" ;;
+        \"*\") line="${line#\"}"; line="${line%\"}" ;;
+    esac
+    printf '%s\n' "$line"
+}
+
+ambercli_config_set() {
+    local key="$1" var val tmp
+    var="$(_ambercli_config_var "$key")"
+
+    if [ "$#" -ge 2 ]; then
+        val="$2"
+    else
+        printf 'Value for %s: ' "$key" >&2
+        read -rs val </dev/tty
+        printf '\n' >&2
+    fi
+
+    mkdir -p "$AMBERCLI_CONFIG_DIR"
+    [ -f "$AMBERCLI_ENV_FILE" ] || : >"$AMBERCLI_ENV_FILE"
+    chmod 600 "$AMBERCLI_ENV_FILE"
+
+    # Single-quote the value (escape embedded single quotes) so it survives
+    # special characters when the env file is sourced.
+    local q
+    q="${val//\'/\'\\\'\'}"
+
+    tmp="$(mktemp "${AMBERCLI_ENV_FILE}.XXXXXX")"
+    chmod 600 "$tmp"
+    # Drop any existing assignment for this var, then append the new one.
+    grep -vE "^${var}=" "$AMBERCLI_ENV_FILE" 2>/dev/null >"$tmp" || true
+    printf "%s='%s'\n" "$var" "$q" >>"$tmp"
+    mv "$tmp" "$AMBERCLI_ENV_FILE"
+    chmod 600 "$AMBERCLI_ENV_FILE"
+}
+
+# --- rendering ---------------------------------------------------------------
+# Pipe filter (stdin->stdout). Passthrough when raw or non-TTY; otherwise prefer
+# sd, then glow, else a minimal built-in ANSI prettifier.
+ambercli_render() {
+    if [ "${AMBERCLI_RAW:-0}" = 1 ] || ! [ -t 1 ]; then
+        cat
+        return
+    fi
+    if command -v sd >/dev/null 2>&1; then
+        sd
+        return
+    fi
+    if command -v glow >/dev/null 2>&1; then
+        glow -
+        return
+    fi
+
+    # Minimal built-in prettifier.
+    local line fenced=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            '```'*)
+                # Toggle fenced code mode; swallow the fence line itself.
+                if [ "$fenced" = 1 ]; then fenced=0; else fenced=1; fi
+                continue
+                ;;
+        esac
+        if [ "$fenced" = 1 ]; then
+            printf '%s    %s%s\n' "$AMBERCLI_DIM" "$line" "$AMBERCLI_RESET"
+            continue
+        fi
+        case "$line" in
+            '#'*)
+                # Header: strip leading #'s and surrounding space, render bold.
+                local h="$line"
+                h="${h#"${h%%[!#]*}"}"
+                h="${h# }"
+                printf '%s%s%s\n' "$AMBERCLI_BOLD" "$h" "$AMBERCLI_RESET"
+                ;;
+            *)
+                printf '%s\n' "$line" | sed -E "s/\*\*([^*]+)\*\*/${AMBERCLI_BOLD}\\1${AMBERCLI_RESET}/g"
+                ;;
+        esac
+    done
+}
+
+# --- secret scrubbing --------------------------------------------------------
+# Pipe filter (stdin->stdout). Best-effort masking of common secret shapes,
+# keeping a short identifying prefix then "...". NOT a guarantee -- extend by
+# adding one `-e` rule per pattern below.
+ambercli_scrub() {
+    sed -E \
+        -e 's/(sk-[A-Za-z0-9]{8})[A-Za-z0-9_-]{4,}/\1.../g' \
+        -e 's/(gh[pousr]_[A-Za-z0-9]{6})[A-Za-z0-9]{4,}/\1.../g' \
+        -e 's/(AKIA[A-Z0-9]{4})[A-Z0-9]{8,}/\1.../g' \
+        -e 's/([Bb]earer[[:space:]]+[A-Za-z0-9._~+/-]{6})[A-Za-z0-9._~+/-]{4,}=*/\1.../g' \
+        -e 's/([Aa]uthorization:[[:space:]]*([A-Za-z]+[[:space:]]+)?[A-Za-z0-9._~+/=-]{6})[A-Za-z0-9._~+/=-]{4,}/\1.../g'
+}
+
+# --- Gemini request ----------------------------------------------------------
+# ambercli_gemini SYSTEM PROMPT MODEL GROUNDING(1|0)
+ambercli_gemini() {
+    local system="$1" prompt="$2" model="$3" grounding="$4"
+
+    # shellcheck disable=SC2154  # GEMINI_API_KEY is set by config/env, not here.
+    if [ -z "${GEMINI_API_KEY:-}" ]; then
+        ambercli_die "GEMINI_API_KEY not set -- run: amber set geminikey   (or add it to $AMBERCLI_ENV_FILE)"
+    fi
+
+    local tools="[]"
+    [ "$grounding" = 1 ] && tools='[{"google_search":{}}]'
+
+    local body
+    body="$(jq -nc \
+        --arg q "$prompt" \
+        --arg sys "$system" \
+        --argjson tools "$tools" \
+        '{system_instruction:{parts:[{text:$sys}]}, contents:[{role:"user",parts:[{text:$q}]}], tools:$tools}')"
+
+    # Function-local scratch dir; cleaned on RETURN.
+    local tmpd
+    tmpd="$(mktemp -d)"
+    trap 'rm -rf "$tmpd"' RETURN
+    local f_src="$tmpd/sources" f_err="$tmpd/err" f_got="$tmpd/got" f_raw="$tmpd/raw"
+    : >"$f_src"; : >"$f_err"; : >"$f_got"; : >"$f_raw"
+
+    # Process one SSE stream from stdin: emit answer text to stdout, accumulate
+    # citations / errors / non-SSE lines into the scratch files.
+    _ambercli_gemini_process() {
+        local line json text src err
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+                'data: '*) json="${line#data: }" ;;
+                data:*)    json="${line#data:}" ;;
+                '') continue ;;
+                *) printf '%s\n' "$line" >>"$f_raw"; continue ;;
+            esac
+            [ -z "$json" ] && continue
+            [ "$json" = "[DONE]" ] && continue
+
+            text="$(printf '%s' "$json" | jq -r '.candidates[0].content.parts[0].text // empty' 2>/dev/null)"
+            if [ -n "$text" ]; then
+                printf '%s' "$text"
+                printf '1' >>"$f_got"
+            fi
+
+            src="$(printf '%s' "$json" | jq -r '.candidates[0].groundingMetadata.groundingChunks[]? | .web // empty | [(.title // .uri // ""),(.uri // "")] | @tsv' 2>/dev/null)"
+            [ -n "$src" ] && printf '%s\n' "$src" >>"$f_src"
+
+            if [ -z "$text" ]; then
+                err="$(printf '%s' "$json" | jq -r '(.error.message // .[0].error.message) // empty' 2>/dev/null)"
+                [ -n "$err" ] && printf '%s\n' "$err" >>"$f_err"
+            fi
+        done
+    }
+
+    # Run the curl stream through the processor; detect curl failure via PIPESTATUS.
+    _ambercli_gemini_stream() {
+        local rc
+        if curl -sS --no-buffer \
+            -H "x-goog-api-key: $GEMINI_API_KEY" \
+            -H 'Content-Type: application/json' \
+            --data-binary "$body" \
+            "$AMBERCLI_GEMINI_API_BASE/models/$model:streamGenerateContent?alt=sse" \
+            | _ambercli_gemini_process; then
+            rc="${PIPESTATUS[0]}"
+            [ "$rc" -eq 0 ] || printf 'curl failed (exit %s)\n' "$rc" >>"$f_err"
+        else
+            rc="${PIPESTATUS[0]}"
+            printf 'curl failed (exit %s)\n' "$rc" >>"$f_err"
+        fi
+    }
+
+    if [ "${AMBERCLI_RAW:-0}" = 1 ] || [ ! -t 1 ]; then
+        _ambercli_gemini_stream
+        printf '\n'
+    else
+        _ambercli_gemini_stream | ambercli_render
+    fi
+
+    # Error handling.
+    if [ -s "$f_err" ]; then
+        ambercli_die "$(head -n1 "$f_err")"
+    fi
+    if [ ! -s "$f_got" ]; then
+        local raw_err=""
+        [ -s "$f_raw" ] && raw_err="$(jq -rs '.[]?.error.message // empty' "$f_raw" 2>/dev/null | head -n1)"
+        if [ -n "$raw_err" ]; then
+            ambercli_die "$raw_err"
+        fi
+        ambercli_die "empty response from API"
+    fi
+
+    # Citations (suppressed in raw mode), deduped by URL, dim.
+    if [ "${AMBERCLI_RAW:-0}" != 1 ] && [ -s "$f_src" ]; then
+        local printed=0 title url
+        while IFS=$'\t' read -r title url; do
+            [ -z "$url" ] && continue
+            if [ "$printed" = 0 ]; then printf '\n'; printed=1; fi
+            [ -z "$title" ] && title="$url"
+            printf '%s» %s -- %s%s\n' "$AMBERCLI_DIM" "$title" "$url" "$AMBERCLI_RESET"
+        done < <(awk -F'\t' 'NF && $2!="" && !seen[$2]++' "$f_src")
+    fi
+}
+
+# --- version -----------------------------------------------------------------
+ambercli_version() {
+    local v
+    # `|| true` so a tag-less repo / missing .git (git exits nonzero) doesn't
+    # trip `set -e` in callers. Prefer the release tag, else the short commit SHA.
+    v="$(git -C "$AMBERCLI_SELF_DIR" describe --tags 2>/dev/null || true)"
+    [ -n "$v" ] || v="$(git -C "$AMBERCLI_SELF_DIR" rev-parse --short HEAD 2>/dev/null || true)"
+    [ -n "$v" ] || v="unknown"
+    printf '%s\n' "$v"
+}
+
+# --- embedded signing key ----------------------------------------------------
+# The amber release signing PUBLIC key, embedded so there is no separate file to
+# ship. NEVER trusted blindly: ambercli_verify_ref imports it into an ephemeral
+# keyring and checks its fingerprint against AMBERCLI_SIGNING_FPR before use.
+_ambercli_signing_key() {
+    cat <<'AMBERCLI_PUBKEY_EOF'
+-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mDMEY06UnhYJKwYBBAHaRw8BAQdAzowPca0ltlg4aWCLol3ZQrw6BVXTYJC2OHK9
+rETGVpW0GWFtYmVyIDxhbWJlckBmbG91cmlzaC5jaD6IkwQTFgoAOxYhBAD8d6JF
+hvxzXaSrJr588zgR7XPUBQJjTpSeAhsDBQsJCAcCAiICBhUKCQgLAgQWAgMBAh4H
+AheAAAoJEL588zgR7XPUs5YA/R29Bhfe0rDRgN6gRSKdOE/OQM2C8BcBGITXrYDE
+HEJQAQCqAH7ynlxIZatIm0xzRj73qux20l/3LwPJEi2hVGiUALg4BGNOlJ4SCisG
+AQQBl1UBBQEBB0CCf2rsmLfZ9i+FOhiqSjDhV7/GFoq3RCvkf9fay2wTaAMBCAeI
+eAQYFgoAIBYhBAD8d6JFhvxzXaSrJr588zgR7XPUBQJjTpSeAhsMAAoJEL588zgR
+7XPUUnsBAOmMrr1XfOTOOMnRHamz3cXHnwGdy0CQLqvkZdsIfVlYAQDWVk5wMlm/
+D5daEhJ0NtlpyeO/HfvMgATo8up3p+0/BrgzBGNOlqUWCSsGAQQB2kcPAQEHQAu8
+HFJZ1N5cjwu89sw8w1/vZwBD+AG2x0YZ/1HJx1HQiO8EGBYKACAWIQQA/HeiRYb8
+c12kqya+fPM4Ee1z1AUCY06WpQIbIgCBCRC+fPM4Ee1z1HYgBBkWCgAdFiEErby6
+L9fj4w2clOGfC17XfdRHRIcFAmNOlqUACgkQC17XfdRHRIcfWwEA3LlnXZp6dATY
+IzlkU+bKaxrGHoZKBx284vw/hXjt46wA/1OdxuVfuxy6Onx5y086sIfP9H5CQDNM
+aaBlLeXrweIPozoA/RSnkfW8gimjfwsDO/XQzvZoXXHrUtgULi5PuTNSDU9CAP4i
+QUHOzs5z1g21O34r3rRGsgLhUEM02OcvoxenhZ3XDrgzBGNOlrUWCSsGAQQB2kcP
+AQEHQMDopueSEioB3PflWno++21W5NPnp30KokRggHp6CseeiO8EGBYKACAWIQQA
+/HeiRYb8c12kqya+fPM4Ee1z1AUCY06WtQIbAgCBCRC+fPM4Ee1z1HYgBBkWCgAd
+FiEEz8udeVMvbwBLkTVRqSVU/08NL3oFAmNOlrUACgkQqSVU/08NL3oJFQEAlE5q
+u7v9pbEyYlm5MV1T/ChHdl4u6ecCPxefRzfVutcA/joi26Tl+pBc2fOIZQ/2nnKK
+ED2KylguobjbeC1Ryl4M4G0A/0S7OJuYOCCZzQFfyRDfVVjHn7HkttHO9vuOAAiI
+CJQtAP9h/J7Lt/San0H35y1PCWqTZozJv3Si1NPk/FSmKVc0Bw==
+=wJoS
+-----END PGP PUBLIC KEY BLOCK-----
+AMBERCLI_PUBKEY_EOF
+}
+
+# --- release signature verification ------------------------------------------
+# ambercli_verify_ref REF
+# Verify that git REF (a tag like vX.Y.Z, or any commit-ish: HEAD, FETCH_HEAD,
+# origin/main, ...) carries a GOOD GPG signature from the PINNED key. Imports the
+# in-repo public key into an EPHEMERAL keyring and confirms its primary
+# fingerprint == AMBERCLI_SIGNING_FPR (never trusts the bundled key blindly), then
+# requires `git verify-{tag,commit} --raw` to emit a VALIDSIG naming that
+# fingerprint -- exit code alone is NOT trusted (a good sig from an unknown key
+# must not pass). Returns 0 on success; ambercli_die on failure. Bypassed LOUDLY by
+# --no-verify / $AMBERCLI_NO_VERIFY=1.
+ambercli_verify_ref() {
+    local ref="$1"
+
+    if [ "${AMBERCLI_NO_VERIFY:-0}" = 1 ]; then
+        printf '%sWARNING: signature verification BYPASSED (--no-verify) -- running UNVERIFIED code.%s\n' \
+            "${AMBERCLI_DIM}" "${AMBERCLI_RESET}" >&2
+        return 0
+    fi
+
+    ambercli_need gpg
+    ambercli_need git
+
+    if [ "$AMBERCLI_SIGNING_FPR" = "REPLACE_WITH_FULL_40_HEX_FINGERPRINT" ]; then
+        ambercli_die "signing fingerprint not pinned (AMBERCLI_SIGNING_FPR is still the placeholder). Set it in install + lib, or pass --no-verify to bypass (discouraged)."
+    fi
+
+    # Ephemeral keyring; never touch the user's real keyring.
+    local gnupg
+    gnupg="$(mktemp -d)"
+    # shellcheck disable=SC2064  # expand $gnupg now so the RETURN trap cleans the right dir.
+    trap "rm -rf '$gnupg'" RETURN
+    chmod 700 "$gnupg"
+
+    # Import the embedded public key (_ambercli_signing_key, defined below).
+    _ambercli_signing_key | GNUPGHOME="$gnupg" gpg --batch --quiet --import 2>/dev/null \
+        || ambercli_die "failed to import the embedded signing key"
+
+    # Confirm the imported key's primary fingerprint matches the pin.
+    local imported
+    imported="$(GNUPGHOME="$gnupg" gpg --batch --with-colons --fingerprint 2>/dev/null \
+        | awk -F: '$1=="fpr"{print $10; exit}')"
+    if [ "$imported" != "$AMBERCLI_SIGNING_FPR" ]; then
+        ambercli_die "bundled key fingerprint ($imported) does not match pinned AMBERCLI_SIGNING_FPR ($AMBERCLI_SIGNING_FPR) -- refusing."
+    fi
+
+    # Verify: tag if REF resolves as one, else commit. Capture --raw status lines.
+    local raw kind
+    if git -C "$AMBERCLI_SELF_DIR" rev-parse -q --verify "refs/tags/$ref" >/dev/null 2>&1; then
+        kind="tag $ref"
+        raw="$(GNUPGHOME="$gnupg" git -C "$AMBERCLI_SELF_DIR" verify-tag --raw "$ref" 2>&1 || true)"
+    else
+        kind="commit $ref"
+        raw="$(GNUPGHOME="$gnupg" git -C "$AMBERCLI_SELF_DIR" verify-commit --raw "$ref" 2>&1 || true)"
+    fi
+
+    # Require an explicit VALIDSIG naming the pinned fingerprint.
+    if printf '%s\n' "$raw" | grep -q "VALIDSIG[^a-zA-Z0-9]*.*${AMBERCLI_SIGNING_FPR}"; then
+        return 0
+    fi
+    ambercli_die "signature verification FAILED for $kind (no VALIDSIG from pinned key $AMBERCLI_SIGNING_FPR). Refusing."
+}
+
+# --- update check ------------------------------------------------------------
+# Notify-only by default, rate-limited once / 24h. Fully fail-silent; never
+# blocks the foreground command and never exits nonzero.
+ambercli_check_update() {
+    [ "${AMBERCLI_NO_UPDATE_CHECK:-0}" = 1 ] && return 0
+    [ -t 1 ] || return 0
+
+    local stamp="$AMBERCLI_CACHE_DIR/last_check" marker="$AMBERCLI_CACHE_DIR/latest"
+    mkdir -p "$AMBERCLI_CACHE_DIR" 2>/dev/null || return 0
+
+    # 1) Surface any PENDING result from the previous run.
+    if [ -s "$marker" ]; then
+        local latest current
+        latest="$(head -n1 "$marker" 2>/dev/null)"
+        current="$(ambercli_version 2>/dev/null)"
+        if [ -n "$latest" ] && [ -n "$current" ] && [ "$latest" != "$current" ]; then
+            if [ "${AMBERCLI_AUTO_UPDATE:-0}" = 1 ]; then
+                printf '%samber: update available (%s -> %s); will auto-update%s\n' \
+                    "$AMBERCLI_DIM" "$current" "$latest" "$AMBERCLI_RESET" >&2
+            else
+                printf '%samber: update available (%s -> %s); run: amber update%s\n' \
+                    "$AMBERCLI_DIM" "$current" "$latest" "$AMBERCLI_RESET" >&2
+            fi
+        fi
+    fi
+
+    # 2) If due (>24h or never), kick a background refresh. touch BEFORE network.
+    local due=1
+    if [ -f "$stamp" ]; then
+        if [ -z "$(find "$stamp" -mmin +1440 2>/dev/null)" ]; then
+            due=0
+        fi
+    fi
+    if [ "$due" = 1 ]; then
+        touch "$stamp" 2>/dev/null || true
+        (
+            curl --max-time 2 -s "https://api.github.com/repos/$AMBERCLI_REPO/releases/latest" 2>/dev/null \
+                | jq -r '.tag_name // empty' >"$marker" 2>/dev/null
+            [ -s "$marker" ] || curl --max-time 2 -s "https://api.github.com/repos/$AMBERCLI_REPO/commits/HEAD" 2>/dev/null \
+                | jq -r '.sha[0:12] // empty' >"$marker" 2>/dev/null
+        ) >/dev/null 2>&1 &
+        disown 2>/dev/null || true
+    fi
+    return 0
+}
+
+# --- load user config (secrets / overrides) ----------------------------------
+# `if` form (not `&& .`) so a missing env file returns 0 -- a bare `. lib`
+# under `set -e` must not abort the caller.
+# shellcheck source=/dev/null
+if [ -f "$AMBERCLI_ENV_FILE" ]; then
+    . "$AMBERCLI_ENV_FILE"
+fi

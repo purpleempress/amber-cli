@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# disk -- disk usage by mount. An amber tool.
+#
+# Real filesystems only (pseudo mounts like tmpfs/overlay are skipped), with a
+# usage bar coloured green/amber/red as it fills.
+#
+# SC1091: lib is sourced via a runtime-resolved path; shellcheck can't always
+# locate it across CWDs. The source=../lib hint below covers static analysis.
+# shellcheck disable=SC1091
+set -uo pipefail
+export AMBERCLI_PROG=disk
+_self="$(readlink -f "$0")"
+AMBERCLI_LIB_DIR="$(dirname "$(dirname "$_self")")"
+[ -r "$AMBERCLI_LIB_DIR/lib" ] || { printf 'disk: cannot find lib at %s\n' "$AMBERCLI_LIB_DIR/lib" >&2; exit 1; }
+# shellcheck source=../lib
+. "$AMBERCLI_LIB_DIR/lib"
+
+case "${1:-}" in
+    -h | --help)
+        cat <<'EOF'
+disk -- disk usage by mount
+
+Usage:
+  disk             usage per real filesystem, with a colour-coded bar
+
+Green under 70%, amber 70-90%, red at 90%+. Pseudo filesystems are skipped.
+EOF
+        exit 0
+        ;;
+    --version) ambercli_version; exit 0 ;;
+    "") : ;;
+    *) ambercli_die "unknown argument: $1 (try -h)" ;;
+esac
+
+ambercli_need df
+
+if [ -t 1 ]; then
+    c_green=$'\e[38;5;113m'; c_amber=$'\e[38;5;214m'; c_red=$'\e[38;5;196m'; c_grey=$'\e[38;5;245m'
+else
+    c_green=''; c_amber=''; c_red=''; c_grey=''
+fi
+
+# Bar glyphs follow the same unicode/ascii rule as the glyph table.
+mode="${AMBERCLI_GLYPHS:-}"
+if [ -z "$mode" ]; then
+    case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in *UTF-8* | *utf8* | *UTF8*) mode=unicode ;; *) mode=ascii ;; esac
+fi
+if [ "$mode" = ascii ]; then bar_full='#'; bar_empty='-'; else bar_full='█'; bar_empty='░'; fi
+
+data="$(df -h -x tmpfs -x devtmpfs -x squashfs -x overlay -x efivarfs -x ramfs \
+        -x fuse.portal -x nsfs -x cgroup -x cgroup2 -x mqueue -x debugfs \
+        --output=target,size,used,pcent 2>/dev/null | tail -n +2)" \
+    || ambercli_die "df failed"
+[ -n "$data" ] || { printf '%sno filesystems%s\n' "$c_grey" "$AMBERCLI_RESET"; exit 0; }
+
+printf '%s%sdisk usage%s\n' "$AMBERCLI_BOLD" "$AMBERCLI_ACCENT" "$AMBERCLI_RESET"
+while read -r target size used pcent; do
+    [ -n "$target" ] || continue
+    pct="${pcent%\%}"
+    case "$pct" in ''|*[!0-9]*) pct=0 ;; esac
+    if   [ "$pct" -ge 90 ]; then col="$c_red"
+    elif [ "$pct" -ge 70 ]; then col="$c_amber"
+    else col="$c_green"
+    fi
+    width=12
+    filled=$(( pct * width / 100 ))
+    [ "$filled" -gt "$width" ] && filled="$width"
+    empty=$(( width - filled ))
+    bar=""
+    [ "$filled" -gt 0 ] && bar="$(printf "%${filled}s" '' | tr ' ' "$bar_full")"
+    [ "$empty"  -gt 0 ] && bar="$bar$(printf "%${empty}s" '' | tr ' ' "$bar_empty")"
+    printf '  %s%-18s%s %s%s%s %s%4s%%%s  %s%s/%s%s\n' \
+        "$AMBERCLI_BOLD" "$target" "$AMBERCLI_RESET" \
+        "$col" "$bar" "$AMBERCLI_RESET" \
+        "$col" "$pct" "$AMBERCLI_RESET" \
+        "$c_grey" "$used" "$size" "$AMBERCLI_RESET"
+done <<<"$data"

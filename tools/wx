@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# wx -- terminal weather. An amber tool.
+#
+# Current conditions plus a short forecast, from open-meteo (no API key). With a
+# place name it geocodes that; with no argument it locates you by public IP.
+#
+# SC1091: lib is sourced via a runtime-resolved path; shellcheck can't always
+# locate it across CWDs. The source=../lib hint below covers static analysis.
+# shellcheck disable=SC1091
+set -euo pipefail
+export AMBERCLI_PROG=wx
+_self="$(readlink -f "$0")"
+AMBERCLI_LIB_DIR="$(dirname "$(dirname "$_self")")"
+[ -r "$AMBERCLI_LIB_DIR/lib" ] || { printf 'wx: cannot find lib at %s\n' "$AMBERCLI_LIB_DIR/lib" >&2; exit 1; }
+# shellcheck source=../lib
+. "$AMBERCLI_LIB_DIR/lib"
+
+units="metric"
+parts=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -f | --fahrenheit) units="imperial"; shift ;;
+        --version) ambercli_version; exit 0 ;;
+        -h | --help)
+            cat <<'EOF'
+wx -- terminal weather
+
+Usage:
+  wx [options] [location]
+
+  (no location)   locate you by public IP
+  location        a place name, e.g. "wx kyoto" or "wx san francisco"
+
+Options:
+  -f, --fahrenheit   imperial units (°F, mph)
+EOF
+            exit 0
+            ;;
+        -*) ambercli_die "unknown option: $1 (try -h)" ;;
+        *) parts+=("$1"); shift ;;
+    esac
+done
+
+ambercli_need curl
+ambercli_need jq
+
+t_unit="celsius"; w_unit="kmh"; t_sym="°C"; w_sym="km/h"
+if [ "$units" = imperial ]; then
+    t_unit="fahrenheit"; w_unit="mph"; t_sym="°F"; w_sym="mph"
+fi
+
+# Resolve latitude / longitude / a human label.
+lat=""; lon=""; label=""
+if [ "${#parts[@]}" -gt 0 ]; then
+    query="${parts[*]}"
+    geo="$(curl -fsS -G "$AMBERCLI_OPENMETEO_GEOCODING_API_BASE/search" \
+        --data-urlencode "name=$query" --data 'count=1&language=en&format=json' 2>/dev/null)" \
+        || ambercli_die "geocoding lookup failed"
+    lat="$(jq -r '.results[0].latitude // empty' <<<"$geo")"
+    lon="$(jq -r '.results[0].longitude // empty' <<<"$geo")"
+    [ -n "$lat" ] || ambercli_die "couldn't find a place called '$query'"
+    label="$(jq -r '.results[0] | [.name, .admin1, .country] | map(select(. != null and . != "")) | join(", ")' <<<"$geo")"
+else
+    ip="$(curl -fsS "$AMBERCLI_IPWHOIS_API_BASE/" 2>/dev/null)" || ambercli_die "IP geolocation failed"
+    lat="$(jq -r '.latitude // empty' <<<"$ip")"
+    lon="$(jq -r '.longitude // empty' <<<"$ip")"
+    [ -n "$lat" ] || ambercli_die "couldn't locate you by IP; pass a place name"
+    label="$(jq -r '[.city, .region, .country] | map(select(. != null and . != "")) | join(", ")' <<<"$ip")"
+fi
+
+# WMO weather-interpretation code -> short description.
+wx_desc() {
+    case "$1" in
+        0) printf 'clear sky' ;;
+        1) printf 'mainly clear' ;;
+        2) printf 'partly cloudy' ;;
+        3) printf 'overcast' ;;
+        45 | 48) printf 'fog' ;;
+        51 | 53 | 55) printf 'drizzle' ;;
+        56 | 57) printf 'freezing drizzle' ;;
+        61 | 63 | 65) printf 'rain' ;;
+        66 | 67) printf 'freezing rain' ;;
+        71 | 73 | 75) printf 'snow' ;;
+        77) printf 'snow grains' ;;
+        80 | 81 | 82) printf 'rain showers' ;;
+        85 | 86) printf 'snow showers' ;;
+        95) printf 'thunderstorm' ;;
+        96 | 99) printf 'thunderstorm with hail' ;;
+        *) printf 'unknown' ;;
+    esac
+}
+
+fc="$(curl -fsS -G "$AMBERCLI_OPENMETEO_API_BASE/forecast" \
+    --data-urlencode "latitude=$lat" --data-urlencode "longitude=$lon" \
+    --data "temperature_unit=$t_unit&wind_speed_unit=$w_unit&timezone=auto&forecast_days=4" \
+    --data 'current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m' \
+    --data 'daily=weather_code,temperature_2m_max,temperature_2m_min' 2>/dev/null)" \
+    || ambercli_die "forecast request failed"
+
+cur_t="$(jq -r '.current.temperature_2m // empty' <<<"$fc")"
+[ -n "$cur_t" ] || ambercli_die "no forecast data returned"
+cur_feels="$(jq -r '.current.apparent_temperature' <<<"$fc")"
+cur_hum="$(jq -r '.current.relative_humidity_2m' <<<"$fc")"
+cur_wind="$(jq -r '.current.wind_speed_10m' <<<"$fc")"
+cur_code="$(jq -r '.current.weather_code' <<<"$fc")"
+
+printf '%s%s%s%s\n' "$AMBERCLI_BOLD" "$AMBERCLI_ACCENT" "$label" "$AMBERCLI_RESET"
+printf '  %s%s%s%s, %s   feels %s%s   %s%% humidity   wind %s %s\n' \
+    "$AMBERCLI_BOLD" "$cur_t" "$t_sym" "$AMBERCLI_RESET" "$(wx_desc "$cur_code")" \
+    "$cur_feels" "$t_sym" "$cur_hum" "$cur_wind" "$w_sym"
+
+# Daily forecast (skip today's index 0; show the next few days).
+printf '\n'
+days="$(jq -r '.daily.time | length' <<<"$fc")"
+i=1
+while [ "$i" -lt "$days" ]; do
+    date="$(jq -r ".daily.time[$i]" <<<"$fc")"
+    hi="$(jq -r ".daily.temperature_2m_max[$i]" <<<"$fc")"
+    lo="$(jq -r ".daily.temperature_2m_min[$i]" <<<"$fc")"
+    code="$(jq -r ".daily.weather_code[$i]" <<<"$fc")"
+    dow="$(date -d "$date" '+%a' 2>/dev/null || printf '%s' "$date")"
+    printf '  %s%-3s%s  %s%2s%s / %s%-2s%s %s  %s\n' \
+        "$AMBERCLI_DIM" "$dow" "$AMBERCLI_RESET" \
+        "$AMBERCLI_BOLD" "$hi" "$AMBERCLI_RESET" "$AMBERCLI_DIM" "$lo" "$AMBERCLI_RESET" \
+        "$t_sym" "$(wx_desc "$code")"
+    i=$((i + 1))
+done

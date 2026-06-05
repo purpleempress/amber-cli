@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# ipl -- ip/host lookup. An amber tool.
+#
+# Resolves a hostname's IPs (or takes an IP directly) and geolocates each via
+# ipwho.is. Hostnames resolve through getent, so /etc/hosts + DNS both apply.
+#
+# SC1091: lib is sourced via a runtime-resolved path; shellcheck can't always
+# locate it across CWDs. The source=../lib hint below covers static analysis.
+# shellcheck disable=SC1091
+set -euo pipefail
+export AMBERCLI_PROG=ipl
+_self="$(readlink -f "$0")"
+AMBERCLI_LIB_DIR="$(dirname "$(dirname "$_self")")"
+[ -r "$AMBERCLI_LIB_DIR/lib" ] || { printf 'ipl: cannot find lib at %s\n' "$AMBERCLI_LIB_DIR/lib" >&2; exit 1; }
+# shellcheck source=../lib
+. "$AMBERCLI_LIB_DIR/lib"
+
+case "${1:-}" in
+    -h | --help | "")
+        cat <<'EOF'
+ipl -- look up geolocation for a hostname or IP
+
+Usage:
+  ipl <hostname-or-ip>
+
+A hostname is resolved (getent) and every resulting IP is looked up via
+ipwho.is. Needs curl + jq and network access.
+EOF
+        [ "${1:-}" = "" ] && exit 1 || exit 0
+        ;;
+    --version) ambercli_version; exit 0 ;;
+esac
+
+ambercli_need curl
+ambercli_need jq
+
+target="$1"
+ips="$(getent ahosts "$target" | awk '{print $1}' | sort -u)"
+[ -n "$ips" ] || ambercli_die "could not resolve '$target' to any IP address"
+
+while IFS= read -r ip; do
+    [ -n "$ip" ] || continue
+    printf '\n%s[+]%s Lookup for: %s%s%s\n' \
+        "$AMBERCLI_BOLD" "$AMBERCLI_RESET" "$AMBERCLI_DIM" "$ip" "$AMBERCLI_RESET"
+    curl -s "$AMBERCLI_IPWHOIS_API_BASE/$ip" | jq '{
+        ip, country, region, city, latitude, longitude,
+        connection: .connection,
+        timezone: .timezone.id
+    } | del(.. | nulls)'
+done <<<"$ips"

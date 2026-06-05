@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# SC1091: lib is sourced via a runtime-resolved path; shellcheck can't always
+# locate it across CWDs. The source=../lib hint below covers static analysis.
+# shellcheck disable=SC1091
+set -euo pipefail
+export AMBERCLI_PROG=ask
+_self="$(readlink -f "$0")"
+AMBERCLI_LIB_DIR="$(dirname "$(dirname "$_self")")"
+[ -r "$AMBERCLI_LIB_DIR/lib" ] || { printf 'ask: cannot find lib at %s\n' "$AMBERCLI_LIB_DIR/lib" >&2; exit 1; }
+# lib's final line is a `[ -f env ] && . env` guard that returns nonzero when
+# no env file exists; relax `set -e` across the source so that benign return
+# can't abort the tool. lib aborts on real errors via ambercli_die/exit itself.
+# shellcheck source=../lib
+set +e; . "$AMBERCLI_LIB_DIR/lib"; set -e
+
+usage() {
+    cat <<'EOF'
+ask -- terminal assistant (Gemini, optionally Google-grounded)
+
+Usage:
+  ask [options] <question>
+  <command> | ask [options] <question>
+
+Options:
+  -m, --model <id>   Gemini model id (default: $AMBERCLI_MODEL or built-in)
+      --no-search    Disable Google Search grounding
+      --raw          Raw output: no ANSI rendering, no citations
+      --yes          Assume yes to prompts (e.g. jq install)
+      --version      Print amber version and exit
+  -h, --help         Show this help and exit
+
+Reads stdin as extra context when stdin is not a TTY.
+
+Environment:
+  AMBERCLI_MODEL        Default Gemini model id
+  AMBERCLI_SYSTEM       Override ask's system prompt
+  AMBERCLI_CONFIG_DIR   Config dir (system-prompt file: <dir>/system)
+  GEMINI_API_KEY     Gemini API key (or set via `amber set geminikey`)
+  AMBERCLI_RAW, AMBERCLI_YES, AMBERCLI_AUTOINSTALL, AMBERCLI_GLYPHS -- see the README
+
+Examples:
+  ask how do I find files larger than 1G
+  journalctl -u nginx -n50 | ask 'why is nginx failing to start?'
+  ask --no-search 'rewrite this regex to be POSIX-safe: \d+'
+EOF
+}
+
+chosen=""
+grounding=1
+args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -m | --model)
+            [ $# -ge 2 ] || ambercli_die "$1 requires an argument"
+            chosen="$2"; shift 2 ;;
+        --model=*) chosen="${1#*=}"; shift ;;
+        --no-search) grounding=0; shift ;;
+        --raw) AMBERCLI_RAW=1; shift ;;
+        --yes) AMBERCLI_YES=1; shift ;;
+        # ambercli_version probes `git describe` (rc 128 with no tags) before its
+        # version-probe fallback; relax `set -e` so that probe can't abort us.
+        --version) set +e; ambercli_version; set -e; exit 0 ;;
+        -h | --help) usage; exit 0 ;;
+        --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+        -*) ambercli_die "unknown option: $1 (try --help)" ;;
+        *) args+=("$1"); shift ;;
+    esac
+done
+export AMBERCLI_RAW AMBERCLI_YES
+
+model="${chosen:-${AMBERCLI_MODEL:-$AMBERCLI_DEFAULT_MODEL}}"
+
+question=""
+if [ "${#args[@]}" -gt 0 ]; then
+    question="${args[*]}"
+fi
+
+ctx=""
+if [ ! -t 0 ]; then
+    ctx="$(cat)"
+fi
+
+if [ -z "$question" ] && [ -z "$ctx" ]; then
+    usage >&2
+    exit 1
+fi
+
+if [ -n "$question" ] && [ -n "$ctx" ]; then
+    prompt="$question"$'\n\n--- context (stdin) ---\n'"$ctx"
+elif [ -n "$question" ]; then
+    prompt="$question"
+else
+    prompt="$ctx"
+fi
+
+builtin_system="You are a terminal assistant for an expert Linux user. Be terse: lead with the answer or command, minimal explanation. No preamble or closing summary. Assume deep technical knowledge. Put commands in fenced code blocks. Ground with Google Search only when the answer depends on current info, otherwise answer directly. Flag anything destructive or security-relevant. Respond in English."
+
+if [ -n "${AMBERCLI_SYSTEM:-}" ]; then
+    system="$AMBERCLI_SYSTEM"
+elif [ -f "$AMBERCLI_CONFIG_DIR/system" ]; then
+    system="$(cat "$AMBERCLI_CONFIG_DIR/system")"
+else
+    system="$builtin_system"
+fi
+
+ambercli_need curl
+ambercli_ensure_jq
+
+ambercli_gemini "$system" "$prompt" "$model" "$grounding"

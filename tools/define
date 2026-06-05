@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# define -- look up a word. An amber tool.
+#
+# Definitions, part of speech, and synonyms from the free Dictionary API.
+#
+# SC1091: lib is sourced via a runtime-resolved path; shellcheck can't always
+# locate it across CWDs. The source=../lib hint below covers static analysis.
+# shellcheck disable=SC1091
+set -euo pipefail
+export AMBERCLI_PROG=define
+_self="$(readlink -f "$0")"
+AMBERCLI_LIB_DIR="$(dirname "$(dirname "$_self")")"
+[ -r "$AMBERCLI_LIB_DIR/lib" ] || { printf 'define: cannot find lib at %s\n' "$AMBERCLI_LIB_DIR/lib" >&2; exit 1; }
+# shellcheck source=../lib
+. "$AMBERCLI_LIB_DIR/lib"
+
+case "${1:-}" in
+    -h | --help | "")
+        cat <<'EOF'
+define -- look up a word
+
+Usage:
+  define <word>
+EOF
+        [ "${1:-}" = "" ] && exit 1 || exit 0
+        ;;
+    --version) ambercli_version; exit 0 ;;
+esac
+
+ambercli_need curl
+ambercli_need jq
+
+word="$1"
+# No -f: a 404 ("No Definitions Found") still carries a useful JSON body.
+body="$(curl -sS "$AMBERCLI_DICTIONARY_API_BASE/$word" 2>/dev/null)" || ambercli_die "lookup failed"
+
+# The API returns an array on success, or an object with a "title" on miss.
+if [ "$(jq -r 'type' <<<"$body" 2>/dev/null)" != "array" ]; then
+    ambercli_die "no definition found for '$word'"
+fi
+
+headword="$(jq -r '.[0].word // empty' <<<"$body")"
+phonetic="$(jq -r '[.[].phonetic, .[].phonetics[]?.text] | map(select(. != null and . != "")) | .[0] // ""' <<<"$body")"
+
+printf '%s%s%s%s' "$AMBERCLI_BOLD" "$AMBERCLI_ACCENT" "$headword" "$AMBERCLI_RESET"
+[ -n "$phonetic" ] && printf '  %s%s%s' "$AMBERCLI_DIM" "$phonetic" "$AMBERCLI_RESET"
+printf '\n'
+
+count="$(jq '[.[].meanings[]] | length' <<<"$body")"
+i=0
+while [ "$i" -lt "$count" ]; do
+    pos="$(jq -r "[.[].meanings[]][$i].partOfSpeech // \"\"" <<<"$body")"
+    printf '\n%s%s%s\n' "$AMBERCLI_DIM" "$pos" "$AMBERCLI_RESET"
+    n=1
+    while IFS= read -r def; do
+        [ -n "$def" ] || continue
+        printf '  %s.%s %s\n' "$n" "" "$def"
+        n=$((n + 1))
+    done < <(jq -r "[.[].meanings[]][$i].definitions[0:3][].definition" <<<"$body")
+    syns="$(jq -r "([.[].meanings[]][$i].synonyms // []) | join(\", \")" <<<"$body")"
+    [ -n "$syns" ] && printf '  %ssyn:%s %s\n' "$AMBERCLI_DIM" "$AMBERCLI_RESET" "$syns"
+    i=$((i + 1))
+done

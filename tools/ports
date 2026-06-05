@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# ports -- what's listening, by port. An amber tool.
+#
+# A tidy view of every listening socket: protocol, bind address:port, and the
+# process behind it. Sockets bound to all interfaces (0.0.0.0 / ::) are flagged
+# amber as "exposed"; loopback-only sockets stay calm grey.
+#
+# SC1091: lib is sourced via a runtime-resolved path; shellcheck can't always
+# locate it across CWDs. The source=../lib hint below covers static analysis.
+# shellcheck disable=SC1091
+set -uo pipefail
+export AMBERCLI_PROG=ports
+_self="$(readlink -f "$0")"
+AMBERCLI_LIB_DIR="$(dirname "$(dirname "$_self")")"
+[ -r "$AMBERCLI_LIB_DIR/lib" ] || { printf 'ports: cannot find lib at %s\n' "$AMBERCLI_LIB_DIR/lib" >&2; exit 1; }
+# shellcheck source=../lib
+. "$AMBERCLI_LIB_DIR/lib"
+
+case "${1:-}" in
+    -h | --help)
+        cat <<'EOF'
+ports -- what's listening, by port
+
+Usage:
+  ports            list every listening TCP/UDP socket
+
+Sockets bound to all interfaces (0.0.0.0 / ::) are flagged amber as "exposed";
+loopback-only sockets stay grey. Run with sudo to see process names you don't own.
+EOF
+        exit 0
+        ;;
+    --version) ambercli_version; exit 0 ;;
+    "") : ;;
+    *) ambercli_die "unknown argument: $1 (try -h)" ;;
+esac
+
+ambercli_need ss
+
+if [ -t 1 ]; then
+    c_green=$'\e[38;5;113m'; c_amber=$'\e[38;5;214m'; c_grey=$'\e[38;5;245m'
+else
+    c_green=''; c_amber=''; c_grey=''
+fi
+
+# proto state recvq sendq local peer process...
+raw="$(ss -H -tulnp 2>/dev/null)" || ambercli_die "ss failed"
+[ -n "$raw" ] || { printf '%sno listening sockets%s\n' "$c_grey" "$AMBERCLI_RESET"; exit 0; }
+
+# Build "port<TAB>proto<TAB>exposure<TAB>addr:port<TAB>process" rows, then sort
+# numerically by port for a stable, readable listing.
+rows="$(
+    while read -r proto _ _ _ local _ procfield; do
+        [ -n "$local" ] || continue
+        port="${local##*:}"
+        addr="${local%:*}"
+        case "$addr" in
+            '*' | '0.0.0.0' | '::' | '[::]')        exposure="exposed" ;;
+            127.* | '::1' | '[::1]')                exposure="local" ;;
+            *)                                       exposure="iface" ;;
+        esac
+        # users:(("sshd",pid=1234,fd=3),...) -> sshd/1234
+        proc="$(printf '%s' "$procfield" | sed -n 's/.*(("\([^"]*\)",pid=\([0-9]*\).*/\1\/\2/p')"
+        [ -n "$proc" ] || proc="-"
+        printf '%s\t%s\t%s\t%s\t%s\n' "$port" "$proto" "$exposure" "$local" "$proc"
+    done <<<"$raw" | LC_ALL=C sort -t$'\t' -k1,1n -k2,2
+)"
+
+am_root=0; [ "$(id -u)" -eq 0 ] && am_root=1
+
+printf '%s%slistening sockets%s\n' "$AMBERCLI_BOLD" "$AMBERCLI_ACCENT" "$AMBERCLI_RESET"
+while IFS=$'\t' read -r port proto exposure local proc; do
+    [ -n "$port" ] || continue
+    case "$exposure" in
+        exposed) col="$c_amber"; dot='●' ;;   # bound to all interfaces
+        iface)   col="$c_green"; dot='●' ;;   # bound to a specific address
+        *)       col="$c_grey";  dot='○' ;;   # loopback only
+    esac
+    printf '  %s%s%s %-4s %s%-24s%s %s\n' \
+        "$col" "$dot" "$AMBERCLI_RESET" "$proto" "$col" "$local" "$AMBERCLI_RESET" "$proc"
+done <<<"$rows"
+
+[ "$am_root" -eq 1 ] || printf '%s(run with sudo to see process names you don'\''t own)%s\n' "$c_grey" "$AMBERCLI_RESET"

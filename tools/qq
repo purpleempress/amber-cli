@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# SC1091: lib is sourced via a runtime-resolved path; shellcheck can't always
+# locate it across CWDs. The source=../lib hint below covers static analysis.
+# shellcheck disable=SC1091
+set -euo pipefail
+export AMBERCLI_PROG=qq
+_self="$(readlink -f "$0")"
+AMBERCLI_LIB_DIR="$(dirname "$(dirname "$_self")")"
+[ -r "$AMBERCLI_LIB_DIR/lib" ] || { printf 'qq: cannot find lib at %s\n' "$AMBERCLI_LIB_DIR/lib" >&2; exit 1; }
+# lib's final line is a `[ -f env ] && . env` guard that returns nonzero when
+# no env file exists; relax `set -e` across the source so that benign return
+# can't abort the tool. lib aborts on real errors via ambercli_die/exit itself.
+# shellcheck source=../lib
+set +e; . "$AMBERCLI_LIB_DIR/lib"; set -e
+
+usage() {
+    cat <<'EOF'
+qq -- diagnose what's on your terminal screen (Gemini, optionally grounded)
+
+Usage:
+  qq [options] [question]
+
+Captures the current terminal screen, strips qq's own invocation, scrubs
+secrets, and asks Gemini to diagnose it. With no question, defaults to
+"explain what's happening here, especially any errors."
+
+Options:
+  -m, --model <id>   Gemini model id (default: $AMBERCLI_MODEL or built-in)
+      --no-search    Disable Google Search grounding
+      --raw          Raw output: no ANSI rendering, no citations
+      --yes          Assume yes to prompts (e.g. jq install)
+      --version      Print amber version and exit
+  -h, --help         Show this help and exit
+
+Environment:
+  AMBERCLI_QQ_CAPTURE_CMD     Screen-capture command (default: kitty remote control)
+  AMBERCLI_QQ_PROMPT_MARKER   Prompt marker used to strip qq's own invocation
+                     (default: $(whoami)@$(hostname -s))
+  AMBERCLI_QQ_SYSTEM          Override qq's system prompt
+  AMBERCLI_MODEL        Default Gemini model id
+  AMBERCLI_CONFIG_DIR   Config dir (system-prompt file: <dir>/qq-system)
+  GEMINI_API_KEY     Gemini API key (or set via `amber set geminikey`)
+  AMBERCLI_RAW, AMBERCLI_YES, AMBERCLI_AUTOINSTALL, AMBERCLI_GLYPHS -- see the README
+
+Examples:
+  qq
+  qq 'why did the build fail?'
+  AMBERCLI_QQ_CAPTURE_CMD='tmux capture-pane -p' qq
+EOF
+}
+
+chosen=""
+grounding=1
+args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -m | --model)
+            [ $# -ge 2 ] || ambercli_die "$1 requires an argument"
+            chosen="$2"; shift 2 ;;
+        --model=*) chosen="${1#*=}"; shift ;;
+        --no-search) grounding=0; shift ;;
+        --raw) AMBERCLI_RAW=1; shift ;;
+        --yes) AMBERCLI_YES=1; shift ;;
+        # ambercli_version probes `git describe` (rc 128 with no tags) before its
+        # version-probe fallback; relax `set -e` so that probe can't abort us.
+        --version) set +e; ambercli_version; set -e; exit 0 ;;
+        -h | --help) usage; exit 0 ;;
+        --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+        -*) ambercli_die "unknown option: $1 (try --help)" ;;
+        *) args+=("$1"); shift ;;
+    esac
+done
+export AMBERCLI_RAW AMBERCLI_YES
+
+model="${chosen:-${AMBERCLI_MODEL:-$AMBERCLI_DEFAULT_MODEL}}"
+
+question="explain what's happening here, especially any errors."
+if [ "${#args[@]}" -gt 0 ]; then
+    question="${args[*]}"
+fi
+
+# --- capture the screen ------------------------------------------------------
+if [ -n "${AMBERCLI_QQ_CAPTURE_CMD:-}" ]; then
+    capture="$(eval "$AMBERCLI_QQ_CAPTURE_CMD")" || ambercli_die "screen capture failed: \$AMBERCLI_QQ_CAPTURE_CMD ('$AMBERCLI_QQ_CAPTURE_CMD') exited nonzero"
+else
+    ambercli_need kitty
+    if ! capture="$(kitty @ get-text --extent=screen 2>/dev/null)"; then
+        ambercli_die "kitty screen capture failed. Enable remote control in kitty.conf:
+    allow_remote_control yes      (or: allow_remote_control socket-only)
+then restart kitty. Or set \$AMBERCLI_QQ_CAPTURE_CMD, e.g.:
+    export AMBERCLI_QQ_CAPTURE_CMD='tmux capture-pane -p'
+    export AMBERCLI_QQ_CAPTURE_CMD='wezterm cli get-text'"
+    fi
+fi
+
+# --- strip qq's own invocation from the bottom of the capture ----------------
+# Derive the prompt marker (e.g. user@host). Delete from the LAST line that
+# contains the marker through end-of-capture, so qq's own command line and any
+# output it produced are removed. Fail-open: if the marker never appears, keep
+# the whole capture (a naive `sed 0,/re/d` on no match would delete everything).
+marker="${AMBERCLI_QQ_PROMPT_MARKER:-$(whoami)@$(hostname -s 2>/dev/null || hostname)}"
+
+strip_self() {
+    # $1 = literal marker string, $2 = text to strip. Prints result to stdout.
+    # Operates on the argument (not stdin) so the marker test can't drain the
+    # pipe that the transform needs to read.
+    local m="$1" text="$2" esc
+    # Fail-open: if the marker never appears, keep the whole capture verbatim
+    # (a naive `sed 0,/re/d` on no match would delete everything).
+    if ! printf '%s' "$text" | grep -qF "$m"; then
+        printf '%s' "$text"
+        return 0
+    fi
+    # Escape sed regex metacharacters in the marker (it may contain '.').
+    esc="$(printf '%s' "$m" | sed 's/[.[\*^$/]/\\&/g')"
+    # Feed a trailing newline so `tac` doesn't glue the unterminated last line
+    # onto its predecessor. Reverse, delete from top through the FIRST reversed
+    # match (= the LAST original match) inclusive, reverse back: everything from
+    # the last marker line to the end of the original is removed.
+    printf '%s\n' "$text" | tac | sed "0,/$esc/d" | tac
+}
+
+capture="$(strip_self "$marker" "$capture")"
+
+# --- scrub secrets, then validate non-empty ----------------------------------
+scrubbed="$(printf '%s' "$capture" | ambercli_scrub)"
+
+if [ -z "${scrubbed//[[:space:]]/}" ]; then
+    ambercli_die "captured an empty screen -- nothing to diagnose"
+fi
+
+prompt="$question"$'\n\n--- terminal screen ---\n'"$scrubbed"
+
+builtin_system="You are a debugging assistant looking at a snapshot of an expert Linux/fish user's terminal: recent commands and their output. Skip basics. Structure your answer: 1) what went wrong (2-4 sentences, real diagnosis not a restatement of the error); 2) the fix as exact commands in fenced code blocks; 3) one line on how to confirm it worked. State assumptions if inferring. Give the most likely cause first, note others briefly. If nothing looks wrong, say so instead of inventing a problem. Ground with Google Search only if diagnosis needs current info (a known bug in a recent release, changed default behaviour), otherwise rely on the screen. Flag anything destructive or security-relevant. Respond in English."
+
+if [ -n "${AMBERCLI_QQ_SYSTEM:-}" ]; then
+    system="$AMBERCLI_QQ_SYSTEM"
+elif [ -f "$AMBERCLI_CONFIG_DIR/qq-system" ]; then
+    system="$(cat "$AMBERCLI_CONFIG_DIR/qq-system")"
+else
+    system="$builtin_system"
+fi
+
+ambercli_need curl
+ambercli_ensure_jq
+
+ambercli_gemini "$system" "$prompt" "$model" "$grounding"

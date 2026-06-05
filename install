@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+#
+# install -- installer for the amber toolkit. curl|bash-able from GitHub raw.
+#   curl -fsSL https://raw.githubusercontent.com/purpleempress/amber-cli/main/install | bash
+#
+# Resolves LIB_DIR/BIN_DIR, clones-or-refreshes the checkout,
+# relinks via `amber link`, ensures deps, and offers a key prompt. Re-runnable.
+# MIT licensed.
+
+set -euo pipefail
+
+AMBERCLI_REPO_URL="https://github.com/purpleempress/amber-cli.git"
+
+# --- pinned trust anchor -----------------------------------------------------
+# This is what you (the human running `curl ... | bash`) inspect over https.
+# Releases are trusted ONLY if signed by this key. MUST match the copy in lib
+# (we assert that below). Replace the placeholder with the real release-key
+# fingerprint before real use; until then, verification HARD-FAILS unless
+# --no-verify is passed.
+INSTALL_SIGNING_FPR="00FC77A24586FC735DA4AB26BE7CF33811ED73D4"
+
+AMBERCLI_PROG=install
+export AMBERCLI_PROG
+
+# --- arg parse ---------------------------------------------------------------
+WANT_SYSTEM=0
+for arg in "$@"; do
+    case "$arg" in
+        --system) WANT_SYSTEM=1 ;;
+        --no-verify) export AMBERCLI_NO_VERIFY=1 ;;
+        -h | --help)
+            cat <<'EOF'
+amber installer
+
+Usage:
+  install [--system] [--no-verify]
+
+  (default)     per-user install into ~/.local/share/amber, links into ~/.local/bin
+  --system      system install into /usr/local/lib/amber, links into /usr/local/bin (sudo)
+  --no-verify   skip GPG signature verification (DISCOURAGED -- dev/bootstrap only)
+
+Honours $AMBERCLI_PREFIX (highest precedence): LIB=$AMBERCLI_PREFIX/lib/amber, BIN=$AMBERCLI_PREFIX/bin
+EOF
+            exit 0
+            ;;
+        *) printf 'install: unknown option: %s\n' "$arg" >&2; exit 1 ;;
+    esac
+done
+
+# --- path resolution ----------------------------------------
+if [ -n "${AMBERCLI_PREFIX:-}" ]; then
+    LIB_DIR="$AMBERCLI_PREFIX/lib/amber"
+    BIN_DIR="$AMBERCLI_PREFIX/bin"
+elif [ "$WANT_SYSTEM" = 1 ]; then
+    LIB_DIR="/usr/local/lib/amber"
+    BIN_DIR="/usr/local/bin"
+else
+    LIB_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/amber"
+    BIN_DIR="$HOME/.local/bin"
+fi
+
+# --- clone or fetch ----------------------------------------------------------
+# Idempotent and SAFE: a fresh clone just copies files; an existing checkout is
+# only FETCHED (no merge) so unverified upstream code never enters the working
+# tree before it is verified. Sets WAS_CLONE.
+WAS_CLONE=0
+clone_or_fetch() {
+    if ! command -v git >/dev/null 2>&1; then
+        printf 'install: git is required but not found; install it and retry\n' >&2
+        exit 1
+    fi
+    if [ -d "$LIB_DIR/.git" ]; then
+        printf 'install: fetching updates in %s\n' "$LIB_DIR" >&2
+        git -C "$LIB_DIR" fetch --tags --quiet origin || {
+            printf 'install: git fetch failed in %s\n' "$LIB_DIR" >&2
+            exit 1
+        }
+    else
+        printf 'install: cloning amber into %s\n' "$LIB_DIR" >&2
+        mkdir -p "$(dirname "$LIB_DIR")"
+        git clone --quiet "$AMBERCLI_REPO_URL" "$LIB_DIR"
+        WAS_CLONE=1
+    fi
+}
+
+relink() {
+    # Canonical relink: amber + all tools symlinked into BIN_DIR (dynamic).
+    if [ "$WANT_SYSTEM" = 1 ]; then
+        "$LIB_DIR/amber" link --system
+    else
+        "$LIB_DIR/amber" link
+    fi
+}
+
+# --- run ---------------------------------------------------------------------
+clone_or_fetch
+
+# Source the freshly-checked-out lib for the helpers (defs + config only -- this
+# is NOT yet running the toolkit). lib is `set -e` safe to source.
+# shellcheck source=lib
+. "$LIB_DIR/lib"
+
+# Detect drift between the fingerprint the human read here and the one lib
+# actually enforces.
+if [ "$INSTALL_SIGNING_FPR" != "$AMBERCLI_SIGNING_FPR" ]; then
+    printf 'install: AMBERCLI_SIGNING_FPR in install and lib disagree -- out of sync; aborting.\n' >&2
+    exit 1
+fi
+
+# --- VERIFY before symlinking or running anything ----------------------------
+# Resolve the target ref: latest signed release tag if any; else the freshly
+# fetched tip (FETCH_HEAD) for a refresh, or HEAD for a fresh clone.
+TARGET="$(git -C "$LIB_DIR" tag -l 'v[0-9]*' | sort -V | tail -n1)"
+if [ -z "$TARGET" ]; then
+    if [ "$WAS_CLONE" = 1 ]; then TARGET="HEAD"; else TARGET="FETCH_HEAD"; fi
+fi
+
+# ambercli_verify_ref hard-fails (refuses) on a bad/unsigned/wrong-key ref, leaving
+# nothing on PATH; it self-bypasses LOUDLY when --no-verify / $AMBERCLI_NO_VERIFY=1.
+ambercli_verify_ref "$TARGET"
+
+# Only now (verified) move the working tree onto the target.
+if git -C "$LIB_DIR" rev-parse -q --verify "refs/tags/$TARGET" >/dev/null 2>&1; then
+    git -C "$LIB_DIR" checkout --quiet "$TARGET"
+elif [ "$WAS_CLONE" != 1 ]; then
+    git -C "$LIB_DIR" merge --ff-only --quiet FETCH_HEAD || {
+        printf 'install: refusing non-fast-forward update of %s; resolve manually\n' "$LIB_DIR" >&2
+        exit 1
+    }
+fi
+
+ambercli_need curl
+ambercli_ensure_jq
+
+# Optional tools -- note only.
+for opt in sd glow; do
+    command -v "$opt" >/dev/null 2>&1 || \
+        printf 'install: note -- optional tool "%s" not found (nicer rendering when present)\n' "$opt" >&2
+done
+
+relink
+
+mkdir -p "$AMBERCLI_CONFIG_DIR"
+
+# Offer (don't force) a key prompt when interactive and no key set.
+if [ -z "$(ambercli_config_get geminikey 2>/dev/null)" ] && [ -t 0 ]; then
+    printf '\nNo Gemini API key configured. Set one now? [y/N] ' >&2
+    read -r reply </dev/tty 2>/dev/null || reply=""
+    case "$reply" in
+        y | Y | yes | YES | Yes) ambercli_config_set geminikey ;;
+        *) printf 'install: skipped -- set it later with: amber set geminikey\n' >&2 ;;
+    esac
+fi
+
+# --- PATH check (instruct, don't silently edit) ------------------------------
+path_line=""
+case ":$PATH:" in
+    *":$BIN_DIR:"*) : ;;  # already present
+    *)
+        case "${SHELL:-}" in
+            */fish) path_line="fish_add_path $BIN_DIR" ;;
+            *)      path_line="export PATH=\"$BIN_DIR:\$PATH\"" ;;
+        esac
+        ;;
+esac
+
+# --- change summary ----------------------------------------------------------
+printf '\n%s\n' "amber: install complete."
+printf '  library:  %s\n' "$LIB_DIR"
+printf '  bindir:   %s\n' "$BIN_DIR"
+printf '  config:   %s\n' "$AMBERCLI_CONFIG_DIR"
+if [ -n "$path_line" ]; then
+    printf '\n  %s is not on your PATH. Add this to your shell config:\n' "$BIN_DIR"
+    printf '    %s\n' "$path_line"
+else
+    printf '  PATH:     ok (%s already on PATH)\n' "$BIN_DIR"
+fi
+printf '\nRun "amber" to get started, or "amber doctor" to verify.\n'

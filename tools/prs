@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# prs -- your open GitHub pull requests. An amber tool.
+#
+# Lists the PRs you've opened and the ones waiting on your review, via the
+# GitHub search API. Needs a token: $GITHUB_TOKEN, `amber set githubtoken`, or a
+# logged-in `gh` CLI.
+#
+# SC1091: lib is sourced via a runtime-resolved path; shellcheck can't always
+# locate it across CWDs. The source=../lib hint below covers static analysis.
+# shellcheck disable=SC1091
+set -euo pipefail
+export AMBERCLI_PROG=prs
+_self="$(readlink -f "$0")"
+AMBERCLI_LIB_DIR="$(dirname "$(dirname "$_self")")"
+[ -r "$AMBERCLI_LIB_DIR/lib" ] || { printf 'prs: cannot find lib at %s\n' "$AMBERCLI_LIB_DIR/lib" >&2; exit 1; }
+# shellcheck source=../lib
+. "$AMBERCLI_LIB_DIR/lib"
+
+case "${1:-}" in
+    -h | --help)
+        cat <<'EOF'
+prs -- your open GitHub pull requests
+
+Usage:
+  prs            PRs you authored + PRs awaiting your review
+
+Token (first found wins): $GITHUB_TOKEN, `amber set githubtoken`, or `gh auth token`.
+EOF
+        exit 0
+        ;;
+    --version) ambercli_version; exit 0 ;;
+    "") : ;;
+    *) ambercli_die "unknown argument: $1 (try -h)" ;;
+esac
+
+ambercli_need curl
+ambercli_need jq
+
+# Token: env, then config, then gh.
+token="${GITHUB_TOKEN:-}"
+[ -n "$token" ] || token="$(ambercli_config_get githubtoken 2>/dev/null || true)"
+[ -n "$token" ] || token="$(gh auth token 2>/dev/null || true)"
+[ -n "$token" ] || ambercli_die "no GitHub token (set GITHUB_TOKEN, run: amber set githubtoken, or: gh auth login)"
+
+# Run a search query and print one row per PR: "#num<TAB>owner/repo<TAB>flag<TAB>title".
+prs_query() {
+    local q="$1" body
+    body="$(curl -fsS -G "$AMBERCLI_GITHUB_API_BASE/search/issues" \
+        -H "Authorization: Bearer $token" \
+        -H 'Accept: application/vnd.github+json' \
+        -H 'X-GitHub-Api-Version: 2022-11-28' \
+        --data-urlencode "q=$q" --data 'per_page=30&sort=updated' 2>/dev/null)" \
+        || ambercli_die "GitHub API request failed (check your token)"
+    local msg
+    msg="$(jq -r '.message // empty' <<<"$body")"
+    [ -z "$msg" ] || ambercli_die "GitHub: $msg"
+    jq -r '.items[]? | [("#" + (.number|tostring)),
+                        (.repository_url | sub(".*/repos/"; "")),
+                        (if .draft then "draft" else "" end),
+                        .title] | @tsv' <<<"$body"
+}
+
+print_section() {
+    local title="$1" rows="$2"
+    printf '%s%s%s\n' "$AMBERCLI_BOLD$AMBERCLI_ACCENT" "$title" "$AMBERCLI_RESET"
+    if [ -z "$rows" ]; then
+        printf '  %s(none)%s\n' "$AMBERCLI_DIM" "$AMBERCLI_RESET"
+        return
+    fi
+    while IFS=$'\t' read -r num repo flag rest; do
+        [ -n "$num" ] || continue
+        local tag=""
+        [ -n "$flag" ] && tag=" ${AMBERCLI_DIM}[$flag]${AMBERCLI_RESET}"
+        printf '  %s%-5s%s %s%s%s  %s%s\n' \
+            "$AMBERCLI_BOLD" "$num" "$AMBERCLI_RESET" \
+            "$AMBERCLI_DIM" "$repo" "$AMBERCLI_RESET" "$rest" "$tag"
+    done <<<"$rows"
+}
+
+mine="$(prs_query 'is:open is:pr author:@me')"
+review="$(prs_query 'is:open is:pr review-requested:@me')"
+
+print_section "yours" "$mine"
+printf '\n'
+print_section "awaiting your review" "$review"
