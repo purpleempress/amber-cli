@@ -239,7 +239,14 @@ verb_update() {
             ;;
         current)
             target="$(git -C "$AMBERCLI_LIB_DIR" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
-            [ -n "$target" ] || ambercli_die "update: no upstream for the current branch (try --edge or --stable)"
+            if [ -z "$target" ]; then
+                # No tracking branch -- this is a release install (detached HEAD
+                # at a signed tag). Default to the latest release tag (stable).
+                tag="$(git -C "$AMBERCLI_LIB_DIR" tag -l 'v[0-9]*' | sort -V | tail -n1)"
+                [ -n "$tag" ] || ambercli_die "update: no upstream and no release tags found (try --edge)"
+                channel="stable"
+                target="$tag"
+            fi
             ;;
     esac
 

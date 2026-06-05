@@ -120,7 +120,9 @@ confirm everything resolved.
 
 **`amber update` channels:**
 
-- *(default)* -- track the current branch's upstream (fast-forward only).
+- *(default)* -- track the current branch's upstream (fast-forward only). A
+  release install sits at a signed tag (detached HEAD), so the default falls
+  back to the latest release tag, same as `--stable`.
 - `--stable` -- check out the latest `vX.Y.Z` release tag.
 - `--edge` -- fast-forward `main`.
 - `--no-verify` -- skip signature verification (**discouraged**; see below).
