@@ -2,10 +2,28 @@
 #
 # install -- installer for the amber toolkit. curl|bash-able from GitHub raw.
 #   curl -fsSL https://raw.githubusercontent.com/purpleempress/amber-cli/main/install | bash
+# Piping into `sh` works too -- the POSIX preamble below re-execs under bash.
 #
 # Resolves LIB_DIR/BIN_DIR, clones-or-refreshes the checkout,
 # relinks via `amber link`, ensures deps, and offers a key prompt. Re-runnable.
 # MIT licensed.
+
+# --- re-exec under bash (POSIX-sh compatible; runs before any bashism) --------
+# The installer needs bash (it sources the bash lib). If a POSIX sh started us
+# (e.g. `curl ... | sh`), hand off transparently: re-run the file if we have
+# one, else re-fetch from the canonical URL and run that under bash.
+AMBERCLI_INSTALL_URL="https://raw.githubusercontent.com/purpleempress/amber-cli/main/install"
+if [ -z "${BASH_VERSION:-}" ]; then
+    if [ -f "$0" ]; then
+        exec bash "$0" "$@"
+    elif command -v curl >/dev/null 2>&1; then
+        exec bash -c "$(curl -fsSL "$AMBERCLI_INSTALL_URL")" install "$@"
+    else
+        echo "amber: the installer needs bash, and curl isn't available to re-fetch." >&2
+        echo "Re-run with: curl -fsSL $AMBERCLI_INSTALL_URL | bash" >&2
+        exit 1
+    fi
+fi
 
 set -euo pipefail
 

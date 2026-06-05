@@ -44,6 +44,9 @@ What's in the box:
 curl -fsSL https://raw.githubusercontent.com/purpleempress/amber-cli/main/install | bash
 ```
 
+`| sh` works too -- the installer re-execs itself under bash if a POSIX shell
+started it.
+
 ### Recommended: download, read, then run
 
 Piping a remote script straight into a shell means trusting it sight unseen.
